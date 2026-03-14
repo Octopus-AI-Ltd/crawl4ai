@@ -122,6 +122,17 @@ async def handle_llm_qa(
             detail=str(e)
         )
 
+async def _job_heartbeat(redis_conn, task_id: str, interval: int = 10):
+    """Periodically stamp a heartbeat so stale-job detection works mid-run."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await redis_conn.hset(f"task:{task_id}", "heartbeat",
+                                  datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+    except asyncio.CancelledError:
+        pass
+
+
 async def process_llm_extraction(
     redis: aioredis.Redis,
     config: dict,
@@ -138,6 +149,7 @@ async def process_llm_extraction(
     """Process LLM extraction in background."""
     # Initialize webhook service
     webhook_service = WebhookDeliveryService(config)
+    hb = asyncio.create_task(_job_heartbeat(redis, task_id))
 
     try:
         # Validate provider
@@ -237,6 +249,8 @@ async def process_llm_extraction(
             webhook_config=webhook_config,
             error=str(e)
         )
+    finally:
+        hb.cancel()
 
 async def handle_markdown_request(
     url: str,
@@ -374,6 +388,8 @@ async def handle_llm_request(
             }
         }, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+HEARTBEAT_STALE_SECONDS = 60
+
 async def handle_task_status(
     redis: aioredis.Redis,
     task_id: str,
@@ -390,6 +406,23 @@ async def handle_task_status(
         )
 
     task = decode_redis_hash(task)
+
+    # Detect zombie jobs: still "processing" but heartbeat went stale
+    if task["status"] == TaskStatus.PROCESSING and task.get("heartbeat"):
+        try:
+            last_hb = datetime.fromisoformat(task["heartbeat"])
+            age = (datetime.now(timezone.utc).replace(tzinfo=None) - last_hb).total_seconds()
+            if age > HEARTBEAT_STALE_SECONDS:
+                await redis.hset(f"task:{task_id}", mapping={
+                    "status": TaskStatus.FAILED,
+                    "error": f"Job lost (no heartbeat for {int(age)}s)",
+                })
+                task["status"] = TaskStatus.FAILED
+                task["error"] = f"Job lost (no heartbeat for {int(age)}s)"
+                logger.warning(f"Marked stale job {task_id} as failed (heartbeat age {int(age)}s)")
+        except (ValueError, KeyError):
+            pass
+
     response = create_task_response(task, task_id, base_url)
 
     if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
@@ -812,6 +845,7 @@ async def handle_crawl_job(
     webhook_service = WebhookDeliveryService(config)
 
     async def _runner():
+        hb = asyncio.create_task(_job_heartbeat(redis, task_id))
         try:
             result = await handle_crawl_request(
                 urls=urls,
@@ -833,8 +867,6 @@ async def handle_crawl_job(
                 webhook_config=webhook_config,
                 result=result
             )
-
-            await asyncio.sleep(5)  # Give Redis time to process the update
         except Exception as exc:
             await redis.hset(f"task:{task_id}", mapping={
                 "status": TaskStatus.FAILED,
@@ -850,6 +882,8 @@ async def handle_crawl_job(
                 webhook_config=webhook_config,
                 error=str(exc)
             )
+        finally:
+            hb.cancel()
 
     background_tasks.add_task(_runner)
     return {"task_id": task_id}

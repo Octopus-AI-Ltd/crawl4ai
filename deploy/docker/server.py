@@ -114,11 +114,37 @@ AsyncWebCrawler.arun = capped_arun
 # ───────────────────── FastAPI lifespan ──────────────────────
 
 
+async def _cleanup_stale_jobs(redis_conn):
+    """Mark any 'processing' jobs as failed on startup — they were orphaned by a restart."""
+    cursor = b"0"
+    cleaned = 0
+    while True:
+        cursor, keys = await redis_conn.scan(cursor=cursor, match="task:*", count=200)
+        for key in keys:
+            status_val = await redis_conn.hget(key, "status")
+            if status_val and status_val.decode("utf-8") == "processing":
+                await redis_conn.hset(key, mapping={
+                    "status": "failed",
+                    "error": "Job interrupted by server restart",
+                })
+                cleaned += 1
+                logger.info(f"Marked orphaned job as failed: {key.decode('utf-8')}")
+        if cursor == b"0" or cursor == 0:
+            break
+    if cleaned:
+        logger.info(f"Cleaned up {cleaned} stale job(s) from previous run")
+    else:
+        logger.info("No stale jobs found in Redis")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     from crawler_pool import init_permanent
     from monitor import MonitorStats
     import monitor as monitor_module
+
+    # Clean up jobs orphaned by the previous shutdown/restart
+    await _cleanup_stale_jobs(redis)
 
     # Initialize monitor
     monitor_module.monitor_stats = MonitorStats(redis)

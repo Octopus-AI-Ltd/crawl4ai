@@ -9,7 +9,7 @@ from base64 import b64encode
 
 import logging
 from typing import Optional, AsyncGenerator
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from fastapi import HTTPException, Request, status
 from fastapi.background import BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -23,7 +23,9 @@ from crawl4ai import (
     BrowserConfig,
     MemoryAdaptiveDispatcher,
     RateLimiter, 
-    LLMConfig
+    LLMConfig,
+    AsyncUrlSeeder,
+    SeedingConfig,
 )
 from crawl4ai.utils import perform_completion_with_backoff
 from crawl4ai.content_filter_strategy import (
@@ -881,6 +883,178 @@ async def handle_crawl_job(
                 urls=urls,
                 webhook_config=webhook_config,
                 error=str(exc)
+            )
+        finally:
+            hb.cancel()
+
+    background_tasks.add_task(_runner)
+    return {"task_id": task_id}
+
+
+# ─────────────────── URL Seeding ────────────────────────────
+
+
+def _filter_by_base_url(urls, base_url, max_depth):
+    """Keep only URLs whose path starts with the base URL path, respecting max_depth."""
+    parsed_base = urlparse(base_url)
+    base_path = parsed_base.path.rstrip("/")
+    base_segments = len([s for s in base_path.split("/") if s])
+
+    filtered = []
+    for item in urls:
+        parsed = urlparse(item["url"])
+        url_path = parsed.path.rstrip("/")
+        if base_path and not url_path.startswith(base_path):
+            continue
+        if max_depth >= 0:
+            url_segments = len([s for s in url_path.split("/") if s])
+            depth = url_segments - base_segments
+            if depth > max_depth:
+                continue
+        filtered.append(item)
+    return filtered
+
+
+def _trim_seed_result(item, extract_head, has_query):
+    """Strip response fields that weren't requested."""
+    trimmed = {"url": item["url"], "status": item.get("status", "unknown")}
+    if extract_head and item.get("head_data"):
+        trimmed["head_data"] = item["head_data"]
+    if has_query and item.get("relevance_score") is not None:
+        trimmed["relevance_score"] = item["relevance_score"]
+    return trimmed
+
+
+def _build_seeding_config(seed_request_dict):
+    """Build a SeedingConfig from the flat request dict, ignoring non-config keys."""
+    config_keys = {
+        "source", "pattern", "live_check", "extract_head", "max_urls",
+        "concurrency", "hits_per_sec", "force", "verbose", "query",
+        "score_threshold", "scoring_method", "filter_nonsense_urls",
+        "cache_ttl_hours", "validate_sitemap_lastmod",
+    }
+    kwargs = {k: v for k, v in seed_request_dict.items() if k in config_keys and v is not None}
+    return SeedingConfig(**kwargs)
+
+
+async def handle_seed_request(
+    seed_request: dict,
+) -> dict:
+    """Discover URLs under the given base URL(s) via sitemap / Common Crawl."""
+    start_mem_mb = _get_memory_mb()
+    start_time = time.time()
+
+    try:
+        urls = seed_request["urls"]
+        max_depth = seed_request.get("max_depth", -1)
+        extract_head = seed_request.get("extract_head", False)
+        has_query = seed_request.get("query") is not None
+
+        seeding_config = _build_seeding_config(seed_request)
+
+        results_by_url = {}
+        total_urls = 0
+
+        async with AsyncUrlSeeder() as seeder:
+            for base_url in urls:
+                if not base_url.startswith(("http://", "https://")):
+                    base_url = "https://" + base_url
+
+                domain = urlparse(base_url).netloc
+                if not domain:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Could not extract domain from URL: {base_url}",
+                    )
+
+                raw_urls = await seeder.urls(domain, seeding_config)
+
+                filtered = _filter_by_base_url(raw_urls, base_url, max_depth)
+
+                trimmed = [
+                    _trim_seed_result(item, extract_head, has_query)
+                    for item in filtered
+                ]
+
+                results_by_url[base_url] = trimmed
+                total_urls += len(trimmed)
+
+        end_mem_mb = _get_memory_mb()
+        end_time = time.time()
+        mem_delta_mb = None
+        if start_mem_mb is not None and end_mem_mb is not None:
+            mem_delta_mb = end_mem_mb - start_mem_mb
+
+        return {
+            "success": True,
+            "results": results_by_url,
+            "total_urls": total_urls,
+            "server_processing_time_s": end_time - start_time,
+            "server_memory_delta_mb": mem_delta_mb,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Seed error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
+async def handle_seed_job(
+    redis,
+    background_tasks: BackgroundTasks,
+    seed_request: dict,
+    config: dict,
+    webhook_config: Optional[Dict] = None,
+) -> dict:
+    """Fire-and-forget seed job. Stores result in Redis for polling."""
+    task_id = f"seed_{uuid4().hex[:8]}"
+
+    task_data = {
+        "status": TaskStatus.PROCESSING,
+        "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "url": json.dumps(seed_request.get("urls", [])),
+        "result": "",
+        "error": "",
+    }
+    if webhook_config:
+        task_data["webhook_config"] = json.dumps(webhook_config)
+
+    await redis.hset(f"task:{task_id}", mapping=task_data)
+
+    webhook_service = WebhookDeliveryService(config)
+
+    async def _runner():
+        hb = asyncio.create_task(_job_heartbeat(redis, task_id))
+        try:
+            result = await handle_seed_request(seed_request)
+            await redis.hset(f"task:{task_id}", mapping={
+                "status": TaskStatus.COMPLETED,
+                "result": json.dumps(result),
+            })
+            await webhook_service.notify_job_completion(
+                task_id=task_id,
+                task_type="seed",
+                status="completed",
+                urls=seed_request.get("urls", []),
+                webhook_config=webhook_config,
+                result=result,
+            )
+        except Exception as exc:
+            await redis.hset(f"task:{task_id}", mapping={
+                "status": TaskStatus.FAILED,
+                "error": str(exc),
+            })
+            await webhook_service.notify_job_completion(
+                task_id=task_id,
+                task_type="seed",
+                status="failed",
+                urls=seed_request.get("urls", []),
+                webhook_config=webhook_config,
+                error=str(exc),
             )
         finally:
             hb.cancel()

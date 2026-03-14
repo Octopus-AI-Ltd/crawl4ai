@@ -88,6 +88,61 @@ class JSEndpointRequest(BaseModel):
     )
 
 
+class SeedRequest(BaseModel):
+    """Request body for the /seed endpoint — URL discovery via sitemap/Common Crawl."""
+    urls: List[str] = Field(
+        min_length=1, max_length=50,
+        description="Base URL(s) to scope discovery (e.g. 'https://example.com/blogs')")
+    source: str = Field(
+        "sitemap+cc",
+        description="URL source: 'sitemap', 'cc', or 'sitemap+cc'")
+    pattern: Optional[str] = Field(
+        "*",
+        description="Additional glob URL filter (e.g. '*.html')")
+    max_depth: int = Field(
+        -1, ge=-1,
+        description="Max path segments beyond base URL (-1 = unlimited)")
+    extract_head: bool = Field(
+        False,
+        description="Extract <head> metadata (title, meta, og tags, jsonld)")
+    live_check: bool = Field(
+        False,
+        description="HEAD-verify each URL is accessible")
+    max_urls: int = Field(
+        -1,
+        description="Max URLs to return per base URL (-1 = unlimited)")
+    concurrency: int = Field(
+        1000, ge=1,
+        description="Parallel workers")
+    hits_per_sec: int = Field(
+        5, ge=1,
+        description="Rate limit (requests/sec)")
+    force: bool = Field(
+        False,
+        description="Bypass cache, fetch fresh data")
+    query: Optional[str] = Field(
+        None,
+        description="BM25 search query for relevance scoring")
+    scoring_method: Optional[str] = Field(
+        "bm25",
+        description="Scoring method (currently 'bm25')")
+    score_threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="Min relevance score to include URL")
+    filter_nonsense_urls: bool = Field(
+        True,
+        description="Filter utility URLs (robots.txt, etc.)")
+    cache_ttl_hours: int = Field(
+        24, ge=0,
+        description="Hours before sitemap cache expires")
+    validate_sitemap_lastmod: bool = Field(
+        True,
+        description="Refetch if sitemap lastmod is newer")
+    verbose: Optional[bool] = Field(
+        None,
+        description="Show detailed progress")
+
+
 class WebhookConfig(BaseModel):
     """Configuration for webhook notifications."""
     webhook_url: HttpUrl

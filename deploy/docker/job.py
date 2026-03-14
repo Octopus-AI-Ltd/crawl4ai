@@ -1,15 +1,16 @@
 """
-Job endpoints (enqueue + poll) for long-running LL​M extraction and raw crawl.
+Job endpoints (enqueue + poll) for long-running LLM extraction, raw crawl, and URL seeding.
 Relies on the existing Redis task helpers in api.py
 """
 
-from typing import Dict, Optional, Callable
+from typing import Dict, List, Optional, Callable
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel, HttpUrl
 
 from api import (
     handle_llm_request,
     handle_crawl_job,
+    handle_seed_job,
     handle_task_status,
 )
 from schemas import WebhookConfig
@@ -111,6 +112,58 @@ async def crawl_job_enqueue(
 
 @router.get("/crawl/job/{task_id}")
 async def crawl_job_status(
+    request: Request,
+    task_id: str,
+    _td: Dict = Depends(lambda: _token_dep())
+):
+    return await handle_task_status(_redis, task_id, base_url=str(request.base_url))
+
+
+# ---------- SEED job --------------------------------------------------------
+class SeedJobPayload(BaseModel):
+    urls: List[str]
+    source: str = "sitemap+cc"
+    pattern: Optional[str] = "*"
+    max_depth: int = -1
+    extract_head: bool = False
+    live_check: bool = False
+    max_urls: int = -1
+    concurrency: int = 1000
+    hits_per_sec: int = 5
+    force: bool = False
+    query: Optional[str] = None
+    scoring_method: Optional[str] = "bm25"
+    score_threshold: Optional[float] = None
+    filter_nonsense_urls: bool = True
+    cache_ttl_hours: int = 24
+    validate_sitemap_lastmod: bool = True
+    verbose: Optional[bool] = None
+    webhook_config: Optional[WebhookConfig] = None
+
+
+@router.post("/seed/job", status_code=202)
+async def seed_job_enqueue(
+        payload: SeedJobPayload,
+        background_tasks: BackgroundTasks,
+        _td: Dict = Depends(lambda: _token_dep()),
+):
+    webhook_config = None
+    if payload.webhook_config:
+        webhook_config = payload.webhook_config.model_dump(mode='json')
+
+    seed_request = payload.model_dump(exclude={"webhook_config"})
+
+    return await handle_seed_job(
+        _redis,
+        background_tasks,
+        seed_request,
+        config=_config,
+        webhook_config=webhook_config,
+    )
+
+
+@router.get("/seed/job/{task_id}")
+async def seed_job_status(
     request: Request,
     task_id: str,
     _td: Dict = Depends(lambda: _token_dep())

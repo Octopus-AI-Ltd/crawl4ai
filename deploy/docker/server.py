@@ -21,7 +21,8 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from api import (
     handle_markdown_request, handle_llm_qa,
     handle_stream_crawl_request, handle_crawl_request,
-    stream_results
+    stream_results,
+    handle_seed_request,
 )
 from schemas import (
     CrawlRequestWithHooks,
@@ -31,6 +32,7 @@ from schemas import (
     ScreenshotRequest,
     PDFRequest,
     JSEndpointRequest,
+    SeedRequest,
 )
 
 from utils import (
@@ -722,6 +724,26 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         media_type="application/x-ndjson",
         headers=headers,
     )
+
+
+@app.post("/seed")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+@mcp_tool("seed")
+async def seed(
+    request: Request,
+    seed_request: SeedRequest,
+    _td: Dict = Depends(token_dep),
+):
+    """
+    Discover URLs under the given base URL(s) via sitemap and/or Common Crawl.
+    Returns discovered URLs scoped to each base URL path with optional
+    head-metadata extraction and BM25 relevance scoring.
+    """
+    if not seed_request.urls:
+        raise HTTPException(400, "At least one URL required")
+
+    result = await handle_seed_request(seed_request.model_dump())
+    return JSONResponse(result)
 
 
 def chunk_code_functions(code_md: str) -> List[str]:

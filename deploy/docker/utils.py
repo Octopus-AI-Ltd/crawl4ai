@@ -26,17 +26,18 @@ def load_config() -> Dict:
         config = yaml.safe_load(config_file)
     
     # Override Redis URI from environment if set (e.g. Railway's REDIS_URL)
+    # NOTE: print() because this runs before setup_logging()
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
         config["redis"]["uri"] = redis_url
         masked = redis_url.split("@")[-1] if "@" in redis_url else redis_url[:20] + "..."
-        logging.info(f"Redis URI overridden from REDIS_URL env → ...@{masked}")
+        print(f"[CONFIG] Redis URI overridden from REDIS_URL env → ...@{masked}")
     else:
         fallback = config.get("redis", {}).get("uri", "redis://localhost")
-        logging.warning(f"REDIS_URL not set — falling back to config.yml: {fallback}")
+        print(f"[CONFIG] WARNING: REDIS_URL not set — falling back to config.yml: {fallback}")
 
     final_uri = config.get("redis", {}).get("uri", "redis://localhost")
-    logging.info(f"Final Redis URI in use: ...@{final_uri.split('@')[-1] if '@' in final_uri else final_uri}")
+    print(f"[CONFIG] Final Redis URI in use: ...@{final_uri.split('@')[-1] if '@' in final_uri else final_uri}")
 
     # Override LLM provider from environment if set
     llm_provider = os.environ.get("LLM_PROVIDER")

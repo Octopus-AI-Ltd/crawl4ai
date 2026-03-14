@@ -27,7 +27,16 @@ from .extraction_strategy import (
     JsonLxmlExtractionStrategy,
     RegexExtractionStrategy
 )
-from .chunking_strategy import ChunkingStrategy, RegexChunking
+from .chunking_strategy import (
+    ChunkingStrategy,
+    RegexChunking,
+    NlpSentenceChunking,
+    TopicSegmentationChunking,
+    FixedLengthWordChunking,
+    SlidingWindowChunking,
+    OverlappingWindowChunking,
+    IdentityChunking,
+)
 from .markdown_generation_strategy import DefaultMarkdownGenerator
 from .table_extraction import (
     TableExtractionStrategy,
@@ -164,6 +173,12 @@ __all__ = [
     "RegexExtractionStrategy",
     "ChunkingStrategy",
     "RegexChunking",
+    "NlpSentenceChunking",
+    "TopicSegmentationChunking",
+    "FixedLengthWordChunking",
+    "SlidingWindowChunking",
+    "OverlappingWindowChunking",
+    "IdentityChunking",
     "DefaultMarkdownGenerator",
     "TableExtractionStrategy",
     "DefaultTableExtraction",

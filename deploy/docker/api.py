@@ -926,9 +926,14 @@ def _trim_seed_result(item, extract_head, has_query):
 
 
 def _build_seeding_config(seed_request_dict):
-    """Build a SeedingConfig from the flat request dict, ignoring non-config keys."""
+    """Build a SeedingConfig from the flat request dict.
+
+    ``max_urls`` is intentionally excluded — the seeder must discover all URLs
+    for the whole domain so that path/depth post-filtering works correctly.
+    The caller applies ``max_urls`` after filtering.
+    """
     config_keys = {
-        "source", "pattern", "live_check", "extract_head", "max_urls",
+        "source", "pattern", "live_check", "extract_head",
         "concurrency", "hits_per_sec", "force", "verbose", "query",
         "score_threshold", "scoring_method", "filter_nonsense_urls",
         "cache_ttl_hours", "validate_sitemap_lastmod",
@@ -947,6 +952,7 @@ async def handle_seed_request(
     try:
         urls = seed_request["urls"]
         max_depth = seed_request.get("max_depth", -1)
+        max_urls = seed_request.get("max_urls", -1)
         extract_head = seed_request.get("extract_head", False)
         has_query = seed_request.get("query") is not None
 
@@ -970,6 +976,9 @@ async def handle_seed_request(
                 raw_urls = await seeder.urls(domain, seeding_config)
 
                 filtered = _filter_by_base_url(raw_urls, base_url, max_depth)
+
+                if max_urls > 0:
+                    filtered = filtered[:max_urls]
 
                 trimmed = [
                     _trim_seed_result(item, extract_head, has_query)

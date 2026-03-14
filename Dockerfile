@@ -18,9 +18,7 @@ ENV PYTHONFAULTHANDLER=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
-    DEBIAN_FRONTEND=noninteractive \
-    REDIS_HOST=localhost \
-    REDIS_PORT=6379
+    DEBIAN_FRONTEND=noninteractive
 
 ARG PYTHON_VERSION=3.12
 ARG INSTALL_TYPE=default
@@ -41,7 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     python3-dev \
     libjpeg-dev \
-    redis-server \
     supervisor \
     && apt-get clean \ 
     && rm -rf /var/lib/apt/lists/*
@@ -181,9 +178,6 @@ COPY deploy/docker/static ${APP_HOME}/static
 # Change ownership of the application directory to the non-root user
 RUN chown -R appuser:appuser ${APP_HOME}
 
-# give permissions to redis persistence dirs if used
-RUN mkdir -p /var/lib/redis /var/log/redis && chown -R appuser:appuser /var/lib/redis /var/log/redis
-
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD bash -c '\
     MEM=$(free -m | awk "/^Mem:/{print \$2}"); \
@@ -191,10 +185,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
         echo "⚠️ Warning: Less than 2GB RAM available! Your container might need a memory boost! 🚀"; \
         exit 1; \
     fi && \
-    redis-cli ping > /dev/null && \
     curl -f http://localhost:11235/health || exit 1'
-
-EXPOSE 6379
 # Switch to the non-root user before starting the application
 USER appuser
 

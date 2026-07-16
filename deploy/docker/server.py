@@ -153,7 +153,8 @@ async def lifespan(_: FastAPI):
     await monitor_module.monitor_stats.load_from_redis()
     monitor_module.monitor_stats.start_persistence_worker()
 
-    # Initialize browser pool
+    # Register the default browser config — the browser itself starts lazily on
+    # first crawl so an idle service can sleep (Railway serverless)
     await init_permanent(BrowserConfig(
         extra_args=config["crawler"]["browser"].get("extra_args", []),
         **config["crawler"]["browser"].get("kwargs", {}),

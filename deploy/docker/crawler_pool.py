@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 CONFIG = load_config()
 
 # Pool tiers
-PERMANENT: Optional[AsyncWebCrawler] = None  # Always-ready default browser
+PERMANENT: Optional[AsyncWebCrawler] = None  # Shared default browser (started lazily, closed when idle)
+DEFAULT_BROWSER_CONFIG: Optional[BrowserConfig] = None  # Registered at startup, used for lazy start
 HOT_POOL: Dict[str, AsyncWebCrawler] = {}    # Frequent configs
 COLD_POOL: Dict[str, AsyncWebCrawler] = {}   # Rare configs
 LAST_USED: Dict[str, float] = {}
@@ -33,10 +34,17 @@ def _is_default_config(sig: str) -> bool:
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
+    global PERMANENT
     sig = _sig(cfg)
     async with LOCK:
-        # Check permanent browser for default config
-        if PERMANENT and _is_default_config(sig):
+        # Default config uses the shared default browser. It starts lazily on
+        # first use (not at boot) so an idle service generates no background
+        # traffic and can be put to sleep (Railway serverless).
+        if _is_default_config(sig):
+            if PERMANENT is None:
+                logger.info("🔥 Starting default browser (lazy)")
+                PERMANENT = AsyncWebCrawler(config=DEFAULT_BROWSER_CONFIG or cfg, thread_safe=False)
+                await PERMANENT.start()
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             logger.info("🔥 Using permanent browser")
@@ -86,17 +94,28 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         return crawler
 
 async def init_permanent(cfg: BrowserConfig):
-    """Initialize permanent default browser."""
-    global PERMANENT, DEFAULT_CONFIG_SIG
+    """Register the default browser config. The browser itself starts lazily on
+    first use (see get_crawler) and is closed by the janitor when idle, so a
+    quiet service can go to sleep (Railway serverless)."""
+    global DEFAULT_CONFIG_SIG, DEFAULT_BROWSER_CONFIG
     async with LOCK:
-        if PERMANENT:
-            return
         DEFAULT_CONFIG_SIG = _sig(cfg)
-        logger.info("🔥 Creating permanent default browser")
-        PERMANENT = AsyncWebCrawler(config=cfg, thread_safe=False)
-        await PERMANENT.start()
-        LAST_USED[DEFAULT_CONFIG_SIG] = time.time()
-        USAGE_COUNT[DEFAULT_CONFIG_SIG] = 0
+        DEFAULT_BROWSER_CONFIG = cfg
+        logger.info("🔥 Registered default browser config (browser starts on first use)")
+
+async def close_permanent():
+    """Close the default browser (if running). It will be recreated lazily on
+    next use."""
+    global PERMANENT
+    async with LOCK:
+        if PERMANENT is None:
+            return
+        with suppress(Exception):
+            await PERMANENT.close()
+        PERMANENT = None
+        if DEFAULT_CONFIG_SIG:
+            LAST_USED.pop(DEFAULT_CONFIG_SIG, None)
+            USAGE_COUNT.pop(DEFAULT_CONFIG_SIG, None)
 
 async def close_all():
     """Close all browsers."""
@@ -114,6 +133,7 @@ async def close_all():
 
 async def janitor():
     """Adaptive cleanup based on memory pressure."""
+    global PERMANENT
     while True:
         mem_pct = get_container_memory_percent()
 
@@ -162,6 +182,25 @@ async def janitor():
                     try:
                         from monitor import get_monitor
                         await get_monitor().track_janitor_event("close_hot", sig, {"idle_seconds": int(idle_time), "ttl": hot_ttl})
+                    except:
+                        pass
+
+            # Close the default browser when idle (most conservative TTL) so a
+            # quiet service generates no traffic and can sleep (Railway serverless)
+            if PERMANENT and DEFAULT_CONFIG_SIG:
+                idle_time = now - LAST_USED.get(DEFAULT_CONFIG_SIG, now)
+                if idle_time > hot_ttl * 2:
+                    logger.info(f"🧹 Closing idle default browser (idle={idle_time:.0f}s, ttl={hot_ttl * 2})")
+                    with suppress(Exception):
+                        await PERMANENT.close()
+                    PERMANENT = None
+                    LAST_USED.pop(DEFAULT_CONFIG_SIG, None)
+                    USAGE_COUNT.pop(DEFAULT_CONFIG_SIG, None)
+
+                    # Track in monitor
+                    try:
+                        from monitor import get_monitor
+                        await get_monitor().track_janitor_event("close_default", DEFAULT_CONFIG_SIG, {"idle_seconds": int(idle_time), "ttl": hot_ttl * 2})
                     except:
                         pass
 

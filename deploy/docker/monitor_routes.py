@@ -261,28 +261,27 @@ async def restart_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars), or "permanent"
     """
     try:
-        from crawler_pool import (PERMANENT, HOT_POOL, COLD_POOL, LAST_USED,
-                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG, init_permanent)
+        from crawler_pool import (HOT_POOL, COLD_POOL, LAST_USED,
+                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG,
+                                  init_permanent, close_permanent)
         from crawl4ai import AsyncWebCrawler, BrowserConfig
         from contextlib import suppress
         import time
 
-        # Handle permanent browser restart
+        # Handle default ("permanent") browser restart. close_permanent and
+        # init_permanent take the pool LOCK themselves — don't hold it here.
+        # The browser restarts lazily on next use.
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
-            async with LOCK:
-                if PERMANENT:
-                    with suppress(Exception):
-                        await PERMANENT.close()
+            await close_permanent()
 
-                # Reinitialize permanent
-                from utils import load_config
-                config = load_config()
-                await init_permanent(BrowserConfig(
-                    extra_args=config["crawler"]["browser"].get("extra_args", []),
-                    **config["crawler"]["browser"].get("kwargs", {}),
-                ))
+            from utils import load_config
+            config = load_config()
+            await init_permanent(BrowserConfig(
+                extra_args=config["crawler"]["browser"].get("extra_args", []),
+                **config["crawler"]["browser"].get("kwargs", {}),
+            ))
 
-            logger.info("🔄 Restarted permanent browser")
+            logger.info("🔄 Restarted permanent browser (will start on next use)")
             return {"success": True, "restarted": "permanent"}
 
         # Handle hot/cold browser restart

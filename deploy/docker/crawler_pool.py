@@ -18,9 +18,32 @@ LAST_USED: Dict[str, float] = {}
 USAGE_COUNT: Dict[str, int] = {}
 LOCK = asyncio.Lock()
 
+# How many crawls are running on each browser right now, and when the oldest of
+# them started.
+#
+# The janitor measures idleness from the moment a browser was handed OUT, and
+# nothing re-stamped it while the browser was working. A deep crawl asks for one
+# browser and then works for minutes, so a long crawl looked idle for its whole
+# duration. On 2026-08-24 that reaped the browser out from under a running crawl
+# of week2week.co.uk after 313 seconds — just past the 300s cold-pool TTL. The
+# 292 pages still queued then failed instantly with "'NoneType' object has no
+# attribute 'new_context'", the job still reported `completed`, and 68 pages
+# silently replaced a 223-page site.
+#
+# So a browser is only idle once nothing is running on it. `LAST_USED` is now
+# also re-stamped as work finishes, which is what the TTL should have been
+# measuring all along.
+IN_USE: Dict[str, int] = {}
+LEASE_STARTED: Dict[str, float] = {}
+
 # Config
 MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
+# A lease that is never given back would pin a browser for the life of the
+# process — an async generator that nobody consumes or closes is enough to do
+# it. Past this age the janitor stops believing the lease and reclaims the
+# browser, so a leak costs one long-lived browser rather than the pool.
+MAX_LEASE_SEC = CONFIG.get("crawler", {}).get("pool", {}).get("max_lease_sec", 3600)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
 
 def _sig(cfg: BrowserConfig) -> str:
@@ -31,6 +54,96 @@ def _sig(cfg: BrowserConfig) -> str:
 def _is_default_config(sig: str) -> bool:
     """Check if config matches default."""
     return sig == DEFAULT_CONFIG_SIG
+
+def _lease_acquire(sig: str) -> None:
+    """Mark a browser as working. Called as a crawl starts."""
+    if IN_USE.get(sig, 0) == 0:
+        LEASE_STARTED[sig] = time.time()
+    IN_USE[sig] = IN_USE.get(sig, 0) + 1
+    LAST_USED[sig] = time.time()
+
+def _lease_release(sig: str) -> None:
+    """Mark one crawl as finished, and restart the idle clock from now."""
+    remaining = IN_USE.get(sig, 0) - 1
+    if remaining > 0:
+        IN_USE[sig] = remaining
+    else:
+        IN_USE.pop(sig, None)
+        LEASE_STARTED.pop(sig, None)
+    # Idleness is measured from when the work stopped, not from when the browser
+    # was handed out.
+    LAST_USED[sig] = time.time()
+
+def is_busy(sig: str, now: Optional[float] = None) -> bool:
+    """Whether a crawl is running on this browser, and the lease is still credible."""
+    if IN_USE.get(sig, 0) <= 0:
+        return False
+    started = LEASE_STARTED.get(sig)
+    if started is None:
+        return True
+    if (now or time.time()) - started <= MAX_LEASE_SEC:
+        return True
+    logger.warning(
+        f"⚠️  Lease on browser (sig={sig[:8]}) held for over {MAX_LEASE_SEC}s "
+        f"with {IN_USE.get(sig, 0)} crawl(s) outstanding — treating it as idle"
+    )
+    return False
+
+def _track_usage(crawler: AsyncWebCrawler, sig: str) -> AsyncWebCrawler:
+    """
+    Hold a lease on the browser for as long as a crawl is actually running on it.
+
+    Wrapped here rather than at each call site because there are nine of them and
+    every one of them would have to remember; a browser that outlives its crawl
+    is the whole failure this guards against. `arun` covers deep crawls, which
+    run the entire traversal inside one call. `arun_many` returns either a list
+    (work already done) or an async generator (work happens as it is consumed),
+    so the streaming case holds its lease until the stream ends or is closed.
+    """
+    if getattr(crawler, "_pool_usage_tracked", False):
+        return crawler
+
+    original_arun = crawler.arun
+    original_arun_many = crawler.arun_many
+
+    async def arun(*args, **kwargs):
+        _lease_acquire(sig)
+        try:
+            return await original_arun(*args, **kwargs)
+        finally:
+            _lease_release(sig)
+
+    async def guarded_stream(stream):
+        try:
+            async for item in stream:
+                LAST_USED[sig] = time.time()
+                yield item
+        finally:
+            _lease_release(sig)
+
+    async def arun_many(*args, **kwargs):
+        _lease_acquire(sig)
+        released = False
+        try:
+            result = await original_arun_many(*args, **kwargs)
+        except BaseException:
+            _lease_release(sig)
+            raise
+        try:
+            if hasattr(result, "__aiter__"):
+                return guarded_stream(result)
+            released = True
+            _lease_release(sig)
+            return result
+        except BaseException:
+            if not released:
+                _lease_release(sig)
+            raise
+
+    crawler.arun = arun
+    crawler.arun_many = arun_many
+    crawler._pool_usage_tracked = True
+    return crawler
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
@@ -48,14 +161,14 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             logger.info("🔥 Using permanent browser")
-            return PERMANENT
+            return _track_usage(PERMANENT, sig)
 
         # Check hot pool
         if sig in HOT_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             logger.info(f"♨️  Using hot pool browser (sig={sig[:8]})")
-            return HOT_POOL[sig]
+            return _track_usage(HOT_POOL[sig], sig)
 
         # Check cold pool (promote to hot if used 3+ times)
         if sig in COLD_POOL:
@@ -73,10 +186,10 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                 except:
                     pass
 
-                return HOT_POOL[sig]
+                return _track_usage(HOT_POOL[sig], sig)
 
             logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
-            return COLD_POOL[sig]
+            return _track_usage(COLD_POOL[sig], sig)
 
         # Memory check before creating new
         mem_pct = get_container_memory_percent()
@@ -91,7 +204,7 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         COLD_POOL[sig] = crawler
         LAST_USED[sig] = time.time()
         USAGE_COUNT[sig] = 1
-        return crawler
+        return _track_usage(crawler, sig)
 
 async def init_permanent(cfg: BrowserConfig):
     """Register the default browser config. The browser itself starts lazily on
@@ -149,8 +262,12 @@ async def janitor():
 
         now = time.time()
         async with LOCK:
-            # Clean cold pool
+            # Clean cold pool. A browser with a crawl running on it is never
+            # idle, whatever its timestamp says — closing one mid-crawl kills
+            # every page still queued behind it.
             for sig in list(COLD_POOL.keys()):
+                if is_busy(sig, now):
+                    continue
                 if now - LAST_USED.get(sig, now) > cold_ttl:
                     idle_time = now - LAST_USED[sig]
                     logger.info(f"🧹 Closing cold browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
@@ -169,6 +286,8 @@ async def janitor():
 
             # Clean hot pool (more conservative)
             for sig in list(HOT_POOL.keys()):
+                if is_busy(sig, now):
+                    continue
                 if now - LAST_USED.get(sig, now) > hot_ttl:
                     idle_time = now - LAST_USED[sig]
                     logger.info(f"🧹 Closing hot browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
@@ -187,7 +306,7 @@ async def janitor():
 
             # Close the default browser when idle (most conservative TTL) so a
             # quiet service generates no traffic and can sleep (Railway serverless)
-            if PERMANENT and DEFAULT_CONFIG_SIG:
+            if PERMANENT and DEFAULT_CONFIG_SIG and not is_busy(DEFAULT_CONFIG_SIG, now):
                 idle_time = now - LAST_USED.get(DEFAULT_CONFIG_SIG, now)
                 if idle_time > hot_ttl * 2:
                     logger.info(f"🧹 Closing idle default browser (idle={idle_time:.0f}s, ttl={hot_ttl * 2})")

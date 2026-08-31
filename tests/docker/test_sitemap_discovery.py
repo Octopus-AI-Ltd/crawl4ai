@@ -227,5 +227,65 @@ class SitemapDiscoveryTests(unittest.TestCase):
         )
 
 
+class CommonCrawlIndependenceTests(unittest.TestCase):
+    """A sitemap-only seed must not depend on Common Crawl being reachable.
+
+    `urls()` fetched the Common Crawl collection index before doing anything, for
+    every seed, whatever source was asked for. So reading a site's own sitemap was
+    gated on a third party we deliberately never use. On 2026-08-31, hours after #7
+    made sitemap discovery work, Common Crawl was unreachable from the container and
+    every sitemap seed returned HTTP 500:
+
+        httpx.RemoteProtocolError: Server disconnected without sending a response.
+
+    The caller falls back to following links when a seed fails, so the visible
+    symptom is not an error — it is a site with a perfectly good sitemap quietly
+    getting the worse crawl. Which is exactly the failure #7 had just fixed.
+    """
+
+    def setUp(self):
+        import pathlib
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_dir = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _config(self, source):
+        return types.SimpleNamespace(
+            pattern="*", source=source, live_check=False, extract_head=False,
+            concurrency=1, hits_per_sec=None, force=True, verbose=False,
+            max_urls=-1, query=None, score_threshold=None, scoring_method=None,
+            filter_nonsense_urls=False, xml=False,
+        )
+
+    def _seeder(self):
+        seeder = seeder_mod.AsyncUrlSeeder(client=FeelPortoClient())
+        seeder.cache_dir = self.tmp_dir
+
+        async def unreachable():
+            raise sys.modules["httpx"].RequestError("Server disconnected without sending a response.")
+
+        seeder._latest_index = unreachable
+        return seeder
+
+    def test_a_sitemap_seed_works_while_common_crawl_is_down(self):
+        found = asyncio.run(self._seeder().urls("www.feelporto.com", self._config("sitemap")))
+        urls = [f["url"] if isinstance(f, dict) else f for f in found]
+        self.assertGreater(len(urls), 0, "a sitemap seed must not be gated on Common Crawl")
+        self.assertTrue(
+            any("clerigos-charm" in u for u in urls),
+            "and the site's real pages must be what comes back",
+        )
+
+    def test_asking_for_common_crawl_still_reports_it_is_down(self):
+        # The other half: when Common Crawl IS what was asked for, its being
+        # unreachable is a real failure and must not be swallowed.
+        with self.assertRaises(Exception):
+            asyncio.run(self._seeder().urls("www.feelporto.com", self._config("cc")))
+
+
 if __name__ == "__main__":
     unittest.main()

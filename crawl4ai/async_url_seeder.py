@@ -400,10 +400,6 @@ class AsyncUrlSeeder:
         if self.logger and hasattr(self.logger, 'verbose') and config.verbose is not None:
             self.logger.verbose = config.verbose
 
-        # ensure we have the latest CC collection id
-        if self.index_id is None:
-            self.index_id = await self._latest_index()
-
         # Parse source parameter - split by '+' to get list of sources
         sources = source.split('+')
         valid_sources = {"cc", "sitemap"}
@@ -411,6 +407,18 @@ class AsyncUrlSeeder:
             if s not in valid_sources:
                 raise ValueError(
                     f"Invalid source '{s}'. Valid sources are: {', '.join(valid_sources)}")
+
+        # ensure we have the latest CC collection id — but only when Common Crawl is
+        # one of the sources asked for.
+        #
+        # This used to run for every seed, so reading a site's own sitemap was gated on
+        # a third party we were never going to use. On 2026-08-31 that third party was
+        # unreachable from the container and every sitemap-only seed died with "Server
+        # disconnected without sending a response" — and the caller's fallback is to
+        # follow links instead, so a site with a perfectly good sitemap silently gets
+        # the worse crawl, which is the whole failure #7 had just fixed.
+        if "cc" in sources and self.index_id is None:
+            self.index_id = await self._latest_index()
 
         if hits_per_sec:
             if hits_per_sec <= 0:

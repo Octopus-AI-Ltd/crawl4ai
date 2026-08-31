@@ -578,7 +578,11 @@ async def handle_crawl_request(
         crawler_config = CrawlerRunConfig.load(crawler_config)
 
         dispatcher = MemoryAdaptiveDispatcher(
-            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            # The pool's own 95% is a different question — whether to START another
+            # browser. This is when to stop opening PAGES, and has to sit below where
+            # Chromium is actually killed. None resolves it from config.yml, so every
+            # dispatcher brakes at the same point.
+            memory_threshold_percent=config["crawler"]["pool"].get("memory_threshold_percent"),
             rate_limiter=RateLimiter(
                 base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
             ) if config["crawler"]["rate_limiter"]["enabled"] else None
@@ -763,7 +767,11 @@ async def handle_stream_crawl_request(
         crawler_config.stream = True
 
         dispatcher = MemoryAdaptiveDispatcher(
-            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            # The pool's own 95% is a different question — whether to START another
+            # browser. This is when to stop opening PAGES, and has to sit below where
+            # Chromium is actually killed. None resolves it from config.yml, so every
+            # dispatcher brakes at the same point.
+            memory_threshold_percent=config["crawler"]["pool"].get("memory_threshold_percent"),
             rate_limiter=RateLimiter(
                 base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
             )

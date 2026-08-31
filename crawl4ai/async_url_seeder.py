@@ -902,17 +902,30 @@ class AsyncUrlSeeder:
             for suffix in ("/sitemap.xml", "/sitemap_index.xml"):
                 sm = f"{scheme}://{host}{suffix}"
                 resolved = await self._resolve_head(sm)
-                if resolved:
-                    sitemap_url = resolved
-                    # Fetch sitemap content to get lastmod
-                    try:
-                        r = await self.client.get(sitemap_url, timeout=15, follow_redirects=True)
-                        if 200 <= r.status_code < 300:
-                            sitemap_content = r.content
-                            sitemap_lastmod = _parse_sitemap_lastmod(sitemap_content)
-                    except Exception:
-                        pass
-                    break
+                if not resolved:
+                    continue
+
+                # A sitemap counts as found only when fetching it actually returns
+                # something. A HEAD that merely redirects proves nothing: `http://` →
+                # `https://` is a site-wide rule that answers for every URL, real or
+                # not. feelporto.com 404s /sitemap.xml on https, redirects it on http,
+                # and the redirect target is the same 404 — yet that was enough to set
+                # `sitemap_url`, and a set `sitemap_url` skips the robots.txt fallback
+                # below. Its sitemap is listed in robots.txt, at /sitemaps.xml. So the
+                # site published 274 pages, including every apartment, and we crawled
+                # none of them: link-following instead reached filter and pagination
+                # pages and nothing else.
+                try:
+                    r = await self.client.get(resolved, timeout=15, follow_redirects=True)
+                except Exception:
+                    continue
+                if not (200 <= r.status_code < 300):
+                    continue
+
+                sitemap_url = resolved
+                sitemap_content = r.content
+                sitemap_lastmod = _parse_sitemap_lastmod(sitemap_content)
+                break
             if sitemap_url:
                 break
 
@@ -941,15 +954,9 @@ class AsyncUrlSeeder:
                 discovered_urls.append(u)
                 if _match(u, pattern):
                     yield u
-        elif sitemap_url:
-            # We have a sitemap URL but no content (fetch failed earlier), try again
-            self._log("info", "Found sitemap at {url}", params={"url": sitemap_url}, tag="URL_SEED")
-            async for u in self._iter_sitemap(sitemap_url):
-                discovered_urls.append(u)
-                if _match(u, pattern):
-                    yield u
         else:
-            # Fallback: robots.txt
+            # Fallback: robots.txt, which is where a site whose sitemap is not at one
+            # of the two guessed paths says where it actually is.
             robots = f"https://{host}/robots.txt"
             try:
                 r = await self.client.get(robots, timeout=10, follow_redirects=True)

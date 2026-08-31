@@ -93,6 +93,10 @@ MAX_SESSION_PERMIT = config["crawler"]["pool"].get("max_session_permit")
 if MAX_SESSION_PERMIT:
     os.environ["CRAWL4AI_MAX_SESSION_PERMIT"] = str(MAX_SESSION_PERMIT)
 
+CRAWL_MEMORY_THRESHOLD_PERCENT = config["crawler"]["pool"].get("memory_threshold_percent")
+if CRAWL_MEMORY_THRESHOLD_PERCENT:
+    os.environ["CRAWL4AI_MEMORY_THRESHOLD_PERCENT"] = str(CRAWL_MEMORY_THRESHOLD_PERCENT)
+
 # ── security feature flags ───────────────────────────────────
 # Hooks are disabled by default for security (RCE risk). Set to "true" to enable.
 HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "true"

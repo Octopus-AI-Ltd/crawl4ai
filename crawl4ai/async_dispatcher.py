@@ -23,7 +23,7 @@ import random
 from abc import ABC, abstractmethod
 
 from .utils import get_true_memory_usage_percent
-from .resource_limits import default_max_session_permit
+from .resource_limits import RECOVERY_MARGIN_PERCENT, default_max_session_permit, default_memory_threshold_percent
 
 
 class RateLimiter:
@@ -149,9 +149,9 @@ class BaseDispatcher(ABC):
 class MemoryAdaptiveDispatcher(BaseDispatcher):
     def __init__(
         self,
-        memory_threshold_percent: float = 90.0,
+        memory_threshold_percent: Optional[float] = None,
         critical_threshold_percent: float = 95.0,  # New critical threshold
-        recovery_threshold_percent: float = 85.0,  # New recovery threshold
+        recovery_threshold_percent: Optional[float] = None,
         check_interval: float = 1.0,
         max_session_permit: Optional[int] = None,
         fairness_timeout: float = 600.0,  # 10 minutes before prioritizing long-waiting URLs
@@ -160,9 +160,17 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         monitor: Optional[CrawlerMonitor] = None,
     ):
         super().__init__(rate_limiter, monitor)
-        self.memory_threshold_percent = memory_threshold_percent
+        self.memory_threshold_percent = (
+            memory_threshold_percent if memory_threshold_percent is not None else default_memory_threshold_percent()
+        )
         self.critical_threshold_percent = critical_threshold_percent
-        self.recovery_threshold_percent = recovery_threshold_percent
+        # Kept below the brake rather than at a fixed 85, which would sit ABOVE a
+        # lowered brake and leave a crawl flapping in and out of pressure mode.
+        self.recovery_threshold_percent = (
+            recovery_threshold_percent
+            if recovery_threshold_percent is not None
+            else max(0.0, self.memory_threshold_percent - RECOVERY_MARGIN_PERCENT)
+        )
         self.check_interval = check_interval
         self.max_session_permit = max_session_permit if max_session_permit is not None else default_max_session_permit()
         self.fairness_timeout = fairness_timeout

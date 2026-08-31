@@ -65,10 +65,14 @@ def container_memory_usage_percent() -> Optional[float]:
 #
 # Twenty heavy pages at once needs roughly 4 GB, which is the entire container. On
 # 2026-08-31 that took feelporto.com from 10% memory to 99.9% in two minutes and
-# Chromium was killed. Eight leaves room for a crawl to be braked rather than shot:
-# the memory guard checks once a second, and memory climbed about half a percent a
-# second at twenty pages.
-DEFAULT_MAX_SESSION_PERMIT = 8
+# Chromium was killed.
+#
+# Eight was the first attempt at a safe number and was still too many: re-running
+# the same crawl reached 80.3% and Chromium was killed again — better, in that the
+# crawl finished and the pool healed itself, but 65 of 207 pages were lost. Eight
+# of that site's pages is roughly 3 GB on its own. Four leaves the brake below
+# room to work in.
+DEFAULT_MAX_SESSION_PERMIT = 4
 
 
 def default_max_session_permit() -> int:
@@ -84,3 +88,32 @@ def default_max_session_permit() -> int:
     except ValueError:
         return DEFAULT_MAX_SESSION_PERMIT
     return configured if configured > 0 else DEFAULT_MAX_SESSION_PERMIT
+
+
+# The share of the container at which a crawl stops opening new pages.
+#
+# Not a target — a brake. Above this the dispatcher adds no further pages and lets
+# the ones in flight finish, so memory comes back down instead of climbing into an
+# OOM kill.
+#
+# 90 was the library's default and it is above where things actually break: on
+# 2026-08-31 Chromium was killed at 80.3% of the container, so the brake never
+# engaged at all. 70 leaves roughly a gigabyte of headroom for pages that are
+# already open, which is what has to fit — the guard checks once a second, and
+# memory climbed about half a percent a second at twenty pages.
+DEFAULT_MEMORY_THRESHOLD_PERCENT = 70.0
+
+# How far memory must fall before a crawl starts opening pages again. Below the
+# brake, so a crawl hovering exactly at the line does not flap in and out of it.
+RECOVERY_MARGIN_PERCENT = 10.0
+
+
+def default_memory_threshold_percent() -> float:
+    """The brake, tunable without a code change — see default_max_session_permit."""
+    try:
+        configured = float(os.environ.get("CRAWL4AI_MEMORY_THRESHOLD_PERCENT", ""))
+    except ValueError:
+        return DEFAULT_MEMORY_THRESHOLD_PERCENT
+    if 0 < configured <= 100:
+        return configured
+    return DEFAULT_MEMORY_THRESHOLD_PERCENT

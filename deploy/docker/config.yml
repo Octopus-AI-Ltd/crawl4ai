@@ -64,7 +64,11 @@ crawler:
     stream_init: 30.0  # Timeout for stream initialization
     batch_process: 300.0  # Timeout for batch processing
   pool:
-    max_pages: 40                          # ← GLOBAL_SEM permits
+    max_pages: 40                          # ← GLOBAL_SEM permits (concurrent arun calls)
+    # Pages open at once INSIDE one crawl. A deep crawl is a single arun call, so
+    # max_pages above does not cap it — this does. Twenty needs about 4GB, which is
+    # the whole container; see DEFAULT_MAX_SESSION_PERMIT in crawl4ai/resource_limits.py.
+    max_session_permit: 8
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
   browser:
     kwargs:

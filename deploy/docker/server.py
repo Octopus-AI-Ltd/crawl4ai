@@ -78,8 +78,20 @@ setup_logging(config)
 __version__ = "0.5.1-d1"
 
 # ── global page semaphore (hard cap) ─────────────────────────
+# Caps concurrent arun() calls. Note a deep crawl is ONE arun call however many
+# pages it reads, so this does not cap the pages inside it — MAX_SESSION_PERMIT
+# below is what does.
 MAX_PAGES = config["crawler"]["pool"].get("max_pages", 30)
 GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
+
+# ── pages open at once inside one crawl ──────────────────────
+# Published to the environment because a deep crawl never passes a dispatcher:
+# BFSDeepCrawlStrategy hands a level of URLs to arun_many, which builds a
+# MemoryAdaptiveDispatcher with its defaults. Reading it here keeps config.yml the
+# single place this is set. Must happen at import, before any request builds one.
+MAX_SESSION_PERMIT = config["crawler"]["pool"].get("max_session_permit")
+if MAX_SESSION_PERMIT:
+    os.environ["CRAWL4AI_MAX_SESSION_PERMIT"] = str(MAX_SESSION_PERMIT)
 
 # ── security feature flags ───────────────────────────────────
 # Hooks are disabled by default for security (RCE risk). Set to "true" to enable.

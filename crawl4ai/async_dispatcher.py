@@ -23,6 +23,7 @@ import random
 from abc import ABC, abstractmethod
 
 from .utils import get_true_memory_usage_percent
+from .resource_limits import default_max_session_permit
 
 
 class RateLimiter:
@@ -152,7 +153,7 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         critical_threshold_percent: float = 95.0,  # New critical threshold
         recovery_threshold_percent: float = 85.0,  # New recovery threshold
         check_interval: float = 1.0,
-        max_session_permit: int = 20,
+        max_session_permit: Optional[int] = None,
         fairness_timeout: float = 600.0,  # 10 minutes before prioritizing long-waiting URLs
         memory_wait_timeout: Optional[float] = 600.0,
         rate_limiter: Optional[RateLimiter] = None,
@@ -163,7 +164,7 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         self.critical_threshold_percent = critical_threshold_percent
         self.recovery_threshold_percent = recovery_threshold_percent
         self.check_interval = check_interval
-        self.max_session_permit = max_session_permit
+        self.max_session_permit = max_session_permit if max_session_permit is not None else default_max_session_permit()
         self.fairness_timeout = fairness_timeout
         self.memory_wait_timeout = memory_wait_timeout
         self.result_queue = asyncio.Queue()

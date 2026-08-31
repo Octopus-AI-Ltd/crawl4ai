@@ -89,6 +89,98 @@ def is_busy(sig: str, now: Optional[float] = None) -> bool:
     )
     return False
 
+# Reaching a pooled crawler's browser is best-effort: `crawler_strategy` and
+# `browser_manager` are crawl4ai internals, and a fork that moves them must not
+# make every request rebuild its browser. `_UNREACHABLE` is how "we could not
+# look" is kept apart from "we looked, and it is gone".
+_UNREACHABLE = object()
+
+
+def _browser_of(crawler: Optional[AsyncWebCrawler]):
+    """The Playwright browser behind a pooled crawler, or why it cannot be seen."""
+    manager = getattr(getattr(crawler, "crawler_strategy", None), "browser_manager", None)
+    if manager is None:
+        return _UNREACHABLE
+    # BrowserManager.close() sets this back to None, so None means closed, not unknown.
+    return getattr(manager, "browser", None)
+
+
+def is_alive(crawler: Optional[AsyncWebCrawler]) -> bool:
+    """
+    Whether a pooled browser can still be crawled with.
+
+    Chromium dies — it is a separate process and the usual way out is the kernel
+    reclaiming memory. Nothing in the pool noticed. The dead handle stayed in
+    COLD_POOL and every later crawl, of every site, failed in milliseconds with
+    "Browser.new_context: Target page, context or browser has been closed".
+
+    On 2026-08-31 that took the whole platform's crawling down: feelporto.com drove
+    the container from 10% memory to 99.9% in two minutes, Chromium was killed, and
+    afterwards a plain crawl of example.com returned HTTP 500 with that error. The
+    janitor could not clear it either — it only closes browsers it believes are
+    IDLE, and a corpse looks exactly as idle as a healthy browser. Restarting the
+    service was the only way out.
+
+    Deliberately optimistic. A browser is only called dead when we can actually see
+    that it is: reached it and found it closed, or asked and it said disconnected.
+    Anything we cannot inspect is left alone, because wrongly discarding a healthy
+    browser costs a relaunch on every single request.
+    """
+    if crawler is None:
+        return False
+
+    browser = _browser_of(crawler)
+    if browser is _UNREACHABLE:
+        return True
+    if browser is None:
+        return False
+
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        # Playwright raising while being asked the simplest question it has is not a
+        # browser worth keeping.
+        return False
+
+
+def _forget(sig: str) -> None:
+    """Drop every trace of a browser signature from the pool's bookkeeping."""
+    LAST_USED.pop(sig, None)
+    USAGE_COUNT.pop(sig, None)
+    IN_USE.pop(sig, None)
+    LEASE_STARTED.pop(sig, None)
+
+
+async def _discard_dead(
+    sig: str,
+    crawler: Optional[AsyncWebCrawler],
+    tier: Optional[Dict[str, AsyncWebCrawler]],
+    tier_name: str,
+) -> None:
+    """
+    Throw away a browser that has died, so the next caller builds a fresh one.
+
+    Done whether or not a lease says a crawl is running on it: those crawls are
+    already failing page by page, and keeping the corpse to protect them only
+    spreads the failure to everybody else.
+
+    `tier` is None for the default browser, which lives in a global rather than in
+    one of the pool dicts — the caller clears that global.
+    """
+    if tier is not None:
+        tier.pop(sig, None)
+    _forget(sig)
+    logger.warning(f"⚠️  Discarding dead {tier_name} browser (sig={sig[:8]}) — rebuilding on next use")
+    if crawler is not None:
+        with suppress(Exception):
+            await crawler.close()
+    try:
+        from monitor import get_monitor
+        await get_monitor().track_janitor_event("discard_dead", sig, {"tier": tier_name})
+    except:
+        pass
+
+
 def _track_usage(crawler: AsyncWebCrawler, sig: str) -> AsyncWebCrawler:
     """
     Hold a lease on the browser for as long as a crawl is actually running on it.
@@ -154,6 +246,9 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         # first use (not at boot) so an idle service generates no background
         # traffic and can be put to sleep (Railway serverless).
         if _is_default_config(sig):
+            if PERMANENT is not None and not is_alive(PERMANENT):
+                await _discard_dead(sig, PERMANENT, None, "default")
+                PERMANENT = None
             if PERMANENT is None:
                 logger.info("🔥 Starting default browser (lazy)")
                 PERMANENT = AsyncWebCrawler(config=DEFAULT_BROWSER_CONFIG or cfg, thread_safe=False)
@@ -164,6 +259,9 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             return _track_usage(PERMANENT, sig)
 
         # Check hot pool
+        if sig in HOT_POOL and not is_alive(HOT_POOL[sig]):
+            await _discard_dead(sig, HOT_POOL[sig], HOT_POOL, "hot pool")
+
         if sig in HOT_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
@@ -171,6 +269,9 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             return _track_usage(HOT_POOL[sig], sig)
 
         # Check cold pool (promote to hot if used 3+ times)
+        if sig in COLD_POOL and not is_alive(COLD_POOL[sig]):
+            await _discard_dead(sig, COLD_POOL[sig], COLD_POOL, "cold pool")
+
         if sig in COLD_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
@@ -262,6 +363,20 @@ async def janitor():
 
         now = time.time()
         async with LOCK:
+            # Dead browsers go first, before any question of idleness. A corpse
+            # looks exactly as idle as a healthy browser, so the TTL checks below
+            # would keep one for its full 300s and hand it to everyone who asked
+            # in the meantime. This is also the only thing that clears one while
+            # nobody is crawling, which is when it does the least harm.
+            for tier, tier_name in ((COLD_POOL, "cold pool"), (HOT_POOL, "hot pool")):
+                for sig in list(tier.keys()):
+                    if not is_alive(tier[sig]):
+                        await _discard_dead(sig, tier[sig], tier, tier_name)
+
+            if PERMANENT is not None and not is_alive(PERMANENT):
+                await _discard_dead(DEFAULT_CONFIG_SIG or "default", PERMANENT, None, "default")
+                PERMANENT = None
+
             # Clean cold pool. A browser with a crawl running on it is never
             # idle, whatever its timestamp says — closing one mid-crawl kills
             # every page still queued behind it.

@@ -9,6 +9,7 @@ import os
 import subprocess
 import platform
 from .prompts import PROMPT_EXTRACT_BLOCKS
+from .resource_limits import container_memory_usage_percent
 from array import array
 from .html2text import html2text, CustomHTML2Text
 # from .config import *
@@ -3698,10 +3699,27 @@ def get_true_available_memory_gb() -> float:
 def get_true_memory_usage_percent() -> float:
     """
     Get memory usage percentage that accounts for platform differences.
-    
+
+    A container's memory limit is one of those differences, and missing it is not a
+    small inaccuracy — it reads the wrong machine entirely. On Railway psutil sees
+    the 322.7 GB host while the container is held to 3.7 GB, so this returned ~48%
+    while the container sat at 99.9% about to have Chromium killed.
+
+    That figure is what MemoryAdaptiveDispatcher throttles on, so its 90% brake
+    would only engage once the shared HOST passed 290 GB — which is to say never.
+    On 2026-08-31 a crawl of feelporto.com ran 20 pages at once straight into an
+    OOM kill with the brake reporting all was well, and the dead browser it left
+    behind took the whole platform's crawling down with it.
+
+    So where there is a container limit, that limit is what "memory usage" means.
+
     Returns:
         float: Memory usage percentage (0-100)
     """
+    container_percent = container_memory_usage_percent()
+    if container_percent is not None:
+        return container_percent
+
     vm = psutil.virtual_memory()
     total_gb = vm.total / (1024**3)
     available_gb = get_true_available_memory_gb()

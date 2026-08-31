@@ -195,26 +195,21 @@ def verify_email_domain(email: str) -> bool:
         return False
 
 def get_container_memory_percent() -> float:
-    """Get actual container memory usage vs limit (cgroup v1/v2 aware)."""
+    """Container memory usage vs its limit, falling back to the host's own figure.
+
+    The reading itself lives in crawl4ai.resource_limits, shared with the library's
+    dispatcher. Two copies of this question is precisely what broke on 2026-08-31:
+    the pool read the container and saw 99.9%, the dispatcher read the host and saw
+    48%, and the one with the brake attached was the one looking at the wrong number.
+    """
     try:
-        # Try cgroup v2 first
-        usage_path = Path("/sys/fs/cgroup/memory.current")
-        limit_path = Path("/sys/fs/cgroup/memory.max")
-        if not usage_path.exists():
-            # Fall back to cgroup v1
-            usage_path = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-            limit_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        from crawl4ai.resource_limits import container_memory_usage_percent
 
-        usage = int(usage_path.read_text())
-        limit = int(limit_path.read_text())
+        percent = container_memory_usage_percent()
+        if percent is not None:
+            return percent
+    except Exception:
+        pass
 
-        # Handle unlimited (v2: "max", v1: > 1e18)
-        if limit > 1e18:
-            import psutil
-            limit = psutil.virtual_memory().total
-
-        return (usage / limit) * 100
-    except:
-        # Non-container or unsupported: fallback to host
-        import psutil
-        return psutil.virtual_memory().percent
+    import psutil
+    return psutil.virtual_memory().percent

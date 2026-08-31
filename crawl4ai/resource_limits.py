@@ -107,6 +107,19 @@ DEFAULT_MEMORY_THRESHOLD_PERCENT = 70.0
 # brake, so a crawl hovering exactly at the line does not flap in and out of it.
 RECOVERY_MARGIN_PERCENT = 10.0
 
+# How long the brake may stay on once memory is back below it.
+#
+# The recovery point is a guess at a number the container can actually reach, and
+# it can be wrong: a browser at rest holds memory too. On 2026-08-31 a brake at 70%
+# released at 60%, and a crawl of feelporto.com settled at 61.6% — below the brake,
+# above the release, with nothing running to bring it any lower. The brake stayed on
+# and the crawl waited for a number that could never arrive. It was still waiting
+# twelve minutes later, having read nothing.
+#
+# So the release point is a preference, not a condition. Once memory has been below
+# the brake this long, the brake comes off whether or not it was reached.
+PRESSURE_RELEASE_SEC = 30.0
+
 
 def default_memory_threshold_percent() -> float:
     """The brake, tunable without a code change — see default_max_session_permit."""

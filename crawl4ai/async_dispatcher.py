@@ -23,7 +23,12 @@ import random
 from abc import ABC, abstractmethod
 
 from .utils import get_true_memory_usage_percent
-from .resource_limits import RECOVERY_MARGIN_PERCENT, default_max_session_permit, default_memory_threshold_percent
+from .resource_limits import (
+    PRESSURE_RELEASE_SEC,
+    RECOVERY_MARGIN_PERCENT,
+    default_max_session_permit,
+    default_memory_threshold_percent,
+)
 
 
 class RateLimiter:
@@ -180,7 +185,17 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         self.memory_pressure_mode = False  # Flag to indicate when we're in memory pressure mode
         self.current_memory_percent = 0.0  # Track current memory usage
         self._high_memory_start_time: Optional[float] = None
+        # When memory first came back below the brake while the brake was still on.
+        self._below_threshold_since: Optional[float] = None
         
+    def _release_pressure(self) -> None:
+        """Take the brake off and let pages start again."""
+        self.memory_pressure_mode = False
+        self._high_memory_start_time = None
+        self._below_threshold_since = None
+        if self.monitor:
+            self.monitor.update_memory_status("NORMAL")
+
     async def _memory_monitor_task(self):
         """Background task to continuously monitor memory usage and update state"""
         while True:
@@ -188,6 +203,7 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
 
             # Enter memory pressure mode if we cross the threshold
             if self.current_memory_percent >= self.memory_threshold_percent:
+                self._below_threshold_since = None
                 if not self.memory_pressure_mode:
                     self.memory_pressure_mode = True
                     self._high_memory_start_time = time.time()
@@ -208,10 +224,19 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
 
             # Exit memory pressure mode if we go below recovery threshold
             elif self.memory_pressure_mode and self.current_memory_percent <= self.recovery_threshold_percent:
-                self.memory_pressure_mode = False
+                self._release_pressure()
+            elif self.memory_pressure_mode:
+                # Below the brake but not down to the release point. That point is a
+                # guess at a number the container can reach, and it can be wrong — a
+                # browser at rest holds memory too, so a crawl can settle just above
+                # it with nothing running to bring it lower. Waiting for a number
+                # that will never arrive stops the crawl dead, so the brake comes off
+                # on time instead.
+                if self._below_threshold_since is None:
+                    self._below_threshold_since = time.time()
+                elif time.time() - self._below_threshold_since >= PRESSURE_RELEASE_SEC:
+                    self._release_pressure()
                 self._high_memory_start_time = None
-                if self.monitor:
-                    self.monitor.update_memory_status("NORMAL")
             elif self.current_memory_percent < self.memory_threshold_percent:
                 self._high_memory_start_time = None
             

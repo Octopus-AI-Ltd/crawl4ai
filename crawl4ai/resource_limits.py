@@ -177,7 +177,7 @@ def default_task_brake_percent() -> float:
 
 def may_recycle_browser(
     task_percent: Optional[float],
-    open_pages: Optional[int],
+    pages_in_use: Optional[int],
     *,
     owns_browser: bool,
     has_sessions: bool,
@@ -188,13 +188,18 @@ def may_recycle_browser(
 
     Every "no" here is something that went wrong once, or would:
 
-    - `open_pages` of None means the browser could not be inspected. That is not
-      the same as zero, and closing a browser that might have a page open in it
-      loses that page. Not knowing is a reason to leave it alone.
-    - `open_pages` above zero means a crawl is mid-page in this browser. On the
+    - `pages_in_use` above zero means a crawl is mid-page in this browser. On the
       Docker server one browser is shared by every crawl with the same config, so
-      that crawl may not be the one asking. Zero open pages is the only moment
-      the answer is safe, and it is why the brake drains the crawl first.
+      that crawl may not be the one asking. Nothing checked out is the only
+      moment the answer is safe, and it is why the brake drains the crawl first.
+
+      ⚠️ Pages IN USE, not pages that exist. In headless mode crawl4ai leaves the
+      last page open on purpose rather than closing it, so the browser is never
+      empty of page objects. Gating on that count instead, the brake engaged,
+      waited its full two minutes and gave up having restarted nothing - measured
+      2026-09-01 with the threshold forced low enough to trigger.
+    - `pages_in_use` of None means there is no browser to speak of, or its state
+      could not be read. Not knowing is a reason to leave it alone.
     - `owns_browser` false: a browser reached over CDP, or one a managed-browser
       process is running, was not ours to launch and is not ours to kill.
     - `has_sessions` true: a session pins a page the caller expects to still be
@@ -204,7 +209,7 @@ def may_recycle_browser(
     """
     if not owns_browser or has_sessions:
         return False
-    if open_pages is None or open_pages > 0:
+    if pages_in_use is None or pages_in_use > 0:
         return False
     if task_percent is None:
         return False

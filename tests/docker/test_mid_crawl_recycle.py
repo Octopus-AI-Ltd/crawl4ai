@@ -45,10 +45,10 @@ STARVED = 80.0  # well past the recycle line
 QUIET = 5.0  # a container with nothing running
 
 
-def may(task_percent, open_pages, owns_browser=True, has_sessions=False):
+def may(task_percent, pages_in_use, owns_browser=True, has_sessions=False):
     return limits.may_recycle_browser(
         task_percent,
-        open_pages,
+        pages_in_use,
         owns_browser=owns_browser,
         has_sessions=has_sessions,
     )
@@ -58,14 +58,35 @@ class RecycleDecisionTests(unittest.TestCase):
     def test_a_starved_container_with_nothing_open_is_restarted(self):
         self.assertTrue(may(STARVED, 0))
 
-    def test_a_page_still_open_is_never_closed_underneath_its_crawl(self):
+    def test_a_page_still_in_use_is_never_closed_underneath_its_crawl(self):
         # The shared-browser case: this crawl has drained, another has not.
         self.assertFalse(may(STARVED, 1))
 
     def test_a_browser_we_cannot_inspect_is_left_alone(self):
-        # None is not zero. crawl4ai's internals move, and guessing "nothing open"
-        # wrong costs somebody else's page.
+        # None is not zero. crawl4ai's internals move, and guessing "nothing in
+        # use" wrong costs somebody else's page.
         self.assertFalse(may(STARVED, None))
+
+    def test_the_page_headless_mode_never_closes_does_not_block_the_restart(self):
+        """
+        The count is pages IN USE, not pages that exist.
+
+        Measured 2026-09-01 with the brake forced low enough to fire: it engaged
+        at 31%, waited its full two minutes, and gave up having restarted
+        nothing. In headless mode crawl4ai deliberately leaves the last page open
+        rather than closing it — `total_pages <= 1 ... pass` in
+        _crawl_web's finally — so a browser at rest still holds one page object
+        and a check against that number can never reach zero.
+
+        A crawl that has finished with every page it took must be recyclable even
+        though the browser is not empty.
+        """
+        pages_that_exist, pages_checked_out = 1, 0
+        self.assertTrue(may(STARVED, pages_checked_out))
+        self.assertFalse(
+            may(STARVED, pages_that_exist),
+            "counting page objects instead of checkouts is what wedged it",
+        )
 
     def test_a_quiet_container_is_left_alone(self):
         # Relaunching Chromium costs seconds off every crawl that follows, for

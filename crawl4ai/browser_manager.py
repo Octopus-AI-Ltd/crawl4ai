@@ -621,6 +621,13 @@ class BrowserManager:
         # Serialize the mid-crawl browser restart, so two coroutines noticing the
         # same process pressure do not both tear the browser down.
         self._recycle_lock = asyncio.Lock()
+        # Pages checked out for a crawl right now. NOT the number of page objects
+        # the browser holds: in headless mode crawl4ai deliberately leaves the last
+        # page open rather than closing it, so the browser is never empty and a
+        # restart gated on "no pages exist" could never happen. Measured 2026-09-01
+        # with the brake forced low - it engaged, waited its full two minutes, and
+        # gave up without ever restarting anything.
+        self.pages_in_use = 0
         # How many times this manager has restarted its browser to free processes.
         self.process_recycles = 0
         
@@ -1174,6 +1181,19 @@ class BrowserManager:
                 )
             return None
 
+    def note_page_released(self) -> None:
+        """
+        A page handed out by get_page is finished with.
+
+        Called from the crawl's `finally`, so it runs whether the page succeeded,
+        failed or was cancelled. If a path ever forgets to call it the count
+        drifts upward and mid-crawl restarts quietly stop happening - which is
+        the old behaviour, not a new failure, and the brake logs the count so the
+        drift is visible rather than silent.
+        """
+        if self.pages_in_use > 0:
+            self.pages_in_use -= 1
+
     def open_page_count(self) -> Optional[int]:
         """
         How many pages are open across the whole browser, or None if it cannot be told.
@@ -1216,7 +1236,7 @@ class BrowserManager:
         # Cheap check before taking the lock, so the common case costs nothing.
         if not may_recycle_browser(
             container_task_usage_percent(),
-            self.open_page_count(),
+            self.pages_in_use if self.browser is not None else None,
             owns_browser=owns_browser,
             has_sessions=bool(self.sessions),
         ):
@@ -1224,12 +1244,12 @@ class BrowserManager:
 
         async with self._recycle_lock:
             # Read it all again under the lock: another coroutine may have just
-            # restarted the browser, leaving nothing to relieve, or a page may
-            # have opened in the meantime.
+            # restarted the browser, leaving nothing to relieve, or a crawl may
+            # have taken a page in the meantime.
             task_pct = container_task_usage_percent()
             if not may_recycle_browser(
                 task_pct,
-                self.open_page_count(),
+                self.pages_in_use if self.browser is not None else None,
                 owns_browser=owns_browser,
                 has_sessions=bool(self.sessions),
             ):
@@ -1245,6 +1265,8 @@ class BrowserManager:
             # the processes come back only when Chromium itself exits.
             await self.start()
             self.process_recycles += 1
+            # The pages that count are gone with the browser that held them.
+            self.pages_in_use = 0
 
             if self.logger:
                 self.logger.info(
@@ -1347,6 +1369,10 @@ class BrowserManager:
         # If a session_id is specified, store this session so we can reuse later
         if crawlerRunConfig.session_id:
             self.sessions[crawlerRunConfig.session_id] = (context, page, time.time())
+        else:
+            # A session's page is released by killing the session, and a browser
+            # holding sessions is never restarted anyway.
+            self.pages_in_use += 1
 
         return page, context
 

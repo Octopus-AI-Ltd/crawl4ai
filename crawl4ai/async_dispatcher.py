@@ -218,6 +218,11 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         if self.monitor and not self.memory_pressure_mode:
             self.monitor.update_memory_status("NORMAL")
 
+    def _pages_in_use(self):
+        """Pages the browser has checked out, for the brake's warning. Never raises."""
+        manager = getattr(getattr(self.crawler, "crawler_strategy", None), "browser_manager", None)
+        return getattr(manager, "pages_in_use", "unknown")
+
     def _paused(self) -> bool:
         """Whether new pages may not be opened right now, for either reason."""
         return self.memory_pressure_mode or self.task_pressure_mode
@@ -245,12 +250,15 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
 
         held_for = time.time() - (self._task_pressure_since or time.time())
         if held_for >= TASK_BRAKE_MAX_HOLD_SEC:
+            # The page count is in the message because the usual reason a restart
+            # never became possible is that it never reached zero.
             logging.getLogger(__name__).warning(
                 "Releasing the process brake after %.0fs at %.0f%% of the container's "
-                "allowance without managing to restart the browser - crawling on for "
-                "%.0fs, which this may not survive.",
+                "allowance without managing to restart the browser (%s pages still "
+                "checked out) - crawling on for %.0fs, which this may not survive.",
                 held_for,
                 self.current_task_percent,
+                self._pages_in_use(),
                 TASK_BRAKE_COOLDOWN_SEC,
             )
             # Held off, not merely released: the usage that put the brake on is

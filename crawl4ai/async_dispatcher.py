@@ -13,6 +13,7 @@ from .types import AsyncWebCrawler
 
 from collections.abc import AsyncGenerator
 
+import logging
 import time
 import psutil
 import asyncio
@@ -26,8 +27,12 @@ from .utils import get_true_memory_usage_percent
 from .resource_limits import (
     PRESSURE_RELEASE_SEC,
     RECOVERY_MARGIN_PERCENT,
+    TASK_BRAKE_COOLDOWN_SEC,
+    TASK_BRAKE_MAX_HOLD_SEC,
+    container_task_usage_percent,
     default_max_session_permit,
     default_memory_threshold_percent,
+    default_task_brake_percent,
 )
 
 
@@ -187,6 +192,16 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         self._high_memory_start_time: Optional[float] = None
         # When memory first came back below the brake while the brake was still on.
         self._below_threshold_since: Optional[float] = None
+
+        # The other ceiling. Memory is not what a long crawl runs out of - the
+        # container's process allowance is - and nothing was watching it while a
+        # crawl was in flight. See resource_limits.TASK_BRAKE_PERCENT.
+        self.task_threshold_percent = default_task_brake_percent()
+        self.task_pressure_mode = False
+        self.current_task_percent = 0.0
+        self._task_pressure_since: Optional[float] = None
+        # Until when the brake stays off after giving up on a restart.
+        self._task_brake_suppressed_until: float = 0.0
         
     def _release_pressure(self) -> None:
         """Take the brake off and let pages start again."""
@@ -195,6 +210,62 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         self._below_threshold_since = None
         if self.monitor:
             self.monitor.update_memory_status("NORMAL")
+
+    def _release_task_pressure(self) -> None:
+        """Let pages be opened again once the processes have been given back."""
+        self.task_pressure_mode = False
+        self._task_pressure_since = None
+        if self.monitor and not self.memory_pressure_mode:
+            self.monitor.update_memory_status("NORMAL")
+
+    def _pages_in_use(self):
+        """Pages the browser has checked out, for the brake's warning. Never raises."""
+        manager = getattr(getattr(self.crawler, "crawler_strategy", None), "browser_manager", None)
+        return getattr(manager, "pages_in_use", "unknown")
+
+    def _paused(self) -> bool:
+        """Whether new pages may not be opened right now, for either reason."""
+        return self.memory_pressure_mode or self.task_pressure_mode
+
+    async def _relieve_task_pressure(self, active_tasks: list) -> None:
+        """
+        Give the container its processes back, once the crawl has let go of them.
+
+        Only reachable with the brake on and nothing in flight, which is exactly
+        the state a browser can be restarted from. If the restart cannot happen -
+        a browser shared with another crawl that still has pages open, most
+        likely - the brake is released anyway after TASK_BRAKE_MAX_HOLD_SEC: a
+        brake with no way out would hang the crawl silently, which is worse than
+        the crash it is preventing.
+        """
+        if active_tasks or not self.task_pressure_mode:
+            return
+
+        crawler = self.crawler
+        recycle = getattr(crawler, "recycle_browser_if_process_starved", None)
+        if recycle is not None and await recycle():
+            self.current_task_percent = container_task_usage_percent() or 0.0
+            self._release_task_pressure()
+            return
+
+        held_for = time.time() - (self._task_pressure_since or time.time())
+        if held_for >= TASK_BRAKE_MAX_HOLD_SEC:
+            # The page count is in the message because the usual reason a restart
+            # never became possible is that it never reached zero.
+            logging.getLogger(__name__).warning(
+                "Releasing the process brake after %.0fs at %.0f%% of the container's "
+                "allowance without managing to restart the browser (%s pages still "
+                "checked out) - crawling on for %.0fs, which this may not survive.",
+                held_for,
+                self.current_task_percent,
+                self._pages_in_use(),
+                TASK_BRAKE_COOLDOWN_SEC,
+            )
+            # Held off, not merely released: the usage that put the brake on is
+            # still there, so the monitor would re-engage on its next reading and
+            # the crawl would stand still forever without opening a page.
+            self._task_brake_suppressed_until = time.time() + TASK_BRAKE_COOLDOWN_SEC
+            self._release_task_pressure()
 
     async def _memory_monitor_task(self):
         """Background task to continuously monitor memory usage and update state"""
@@ -240,6 +311,24 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
             elif self.current_memory_percent < self.memory_threshold_percent:
                 self._high_memory_start_time = None
             
+            # The process/thread allowance, which is the limit a long crawl
+            # actually hits. Unlike memory, waiting does not bring this down -
+            # Chromium holds its processes until it exits - so the brake's job is
+            # only to get the pages in flight down to zero, which is the one
+            # moment the browser can be restarted safely.
+            self.current_task_percent = container_task_usage_percent() or 0.0
+            if (
+                self.current_task_percent >= self.task_threshold_percent
+                and time.time() >= self._task_brake_suppressed_until
+            ):
+                if not self.task_pressure_mode:
+                    self.task_pressure_mode = True
+                    self._task_pressure_since = time.time()
+                    if self.monitor:
+                        self.monitor.update_memory_status("PRESSURE")
+            elif self.task_pressure_mode:
+                self._release_task_pressure()
+
             # In critical mode, we might need to take more drastic action
             if self.current_memory_percent >= self.critical_threshold_percent:
                 if self.monitor:
@@ -441,8 +530,10 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                             t.cancel()
                         raise exc
 
-                # If memory pressure is low, greedily fill all available slots
-                if not self.memory_pressure_mode:
+                await self._relieve_task_pressure(active_tasks)
+
+                # If nothing is holding us back, greedily fill all available slots
+                if not self._paused():
                     slots = self.max_session_permit - len(active_tasks)
                     while slots > 0:
                         try:
@@ -594,8 +685,10 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                         for t in active_tasks:
                             t.cancel()
                         raise exc
-                # If memory pressure is low, greedily fill all available slots
-                if not self.memory_pressure_mode:
+                await self._relieve_task_pressure(active_tasks)
+
+                # If nothing is holding us back, greedily fill all available slots
+                if not self._paused():
                     slots = self.max_session_permit - len(active_tasks)
                     while slots > 0:
                         try:

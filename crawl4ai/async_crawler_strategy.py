@@ -1069,6 +1069,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             raise e
 
         finally:
+            # Hand the page back before deciding whether to close it. A session
+            # keeps its page, so it was never counted as taken. Runs on success,
+            # failure and cancellation alike - a miss here stops mid-crawl browser
+            # restarts happening at all.
+            if not config.session_id:
+                self.browser_manager.note_page_released()
+
             # If no session_id is given we should close the page
             all_contexts = page.context.browser.contexts
             total_pages = sum(len(context.pages) for context in all_contexts)                
@@ -1605,6 +1612,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 screenshot_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
             return screenshot_data, pdf_data, mhtml_data
         finally:
+            # See _crawl_web's finally: the page has to be handed back, or the
+            # count never returns to zero and the browser is never restarted.
+            self.browser_manager.note_page_released()
             # Clean up the page
             if page:
                 try:

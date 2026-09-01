@@ -229,3 +229,60 @@ def get_container_memory_percent() -> float:
 
     import psutil
     return psutil.virtual_memory().percent
+
+# Fields carried on every page of a crawl result that no caller of the job API
+# reads, and which are almost all of its size.
+#
+# Measured on one real page 2026-09-01, as a share of what was stored for it:
+#
+#     html            72.3%
+#     fit_html        13.4%
+#     cleaned_html     5.6%
+#     links            2.5%
+#     markdown         5.7%   ← the only large field anybody wanted
+#
+# A 500-page crawl of feelporto.com produced a 243 MB result on those terms, and
+# Redis gave up handing it back: the job record ended `completed` with the error
+# "Timeout writing to socket". The API asked for the pages, got an error, and
+# marked the source failed — so a crawl that had just read all 500 pages without
+# a single failure delivered nothing.
+DEFAULT_DROPPED_RESULT_FIELDS = ()
+
+
+def slim_crawl_result(result: Dict, drop_fields) -> Dict:
+    """
+    A crawl result with the named per-page fields removed.
+
+    Returns a new dict; the caller's copy is untouched, because the same result
+    object is also handed to the synchronous /crawl response, which promises
+    every field. Only what is stored for later collection is slimmed.
+
+    Nothing is dropped unless a deployment asks for it. This is a fork used by
+    more than one thing, and silently withholding page HTML from a caller that
+    wanted it would be a far worse bug than the size it saves.
+    """
+    if not drop_fields:
+        return result
+
+    drop = set(drop_fields)
+    results = result.get("results")
+    if not isinstance(results, list):
+        return result
+
+    slimmed = []
+    for page in results:
+        if isinstance(page, dict):
+            slimmed.append({k: v for k, v in page.items() if k not in drop})
+        else:
+            slimmed.append(page)
+
+    return {**result, "results": slimmed}
+
+
+def dropped_result_fields(config: Dict):
+    """The per-page fields this deployment leaves out of a stored crawl result."""
+    jobs = (config or {}).get("crawler", {}).get("jobs") or {}
+    fields = jobs.get("drop_result_fields")
+    if not fields:
+        return DEFAULT_DROPPED_RESULT_FIELDS
+    return tuple(str(f) for f in fields)

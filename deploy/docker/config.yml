@@ -83,6 +83,25 @@ crawler:
     # to lose. Above task_recycle_percent, which is what the restart then tests.
     # A 248-page crawl reached 952 of 1000 on 2026-09-01 and lost 107 pages.
     task_brake_percent: 70
+  jobs:
+    # Per-page fields left out of a stored crawl result. Nothing here is read by
+    # anything collecting a crawl job from this deployment - the API takes the
+    # page's markdown, its URL and its status code - and together they are about
+    # 94% of what a result weighs.
+    #
+    # A 500-page crawl of feelporto.com came to 243 MB with them, and Redis timed
+    # out handing it back: the job finished "completed" carrying the error
+    # "Timeout writing to socket", the API asked for its pages, got an error, and
+    # marked the source failed. Every one of those 500 pages had been read without
+    # a failure. The same result without these fields is roughly 15 MB.
+    #
+    # ⚠️ Only the STORED copy is trimmed. A synchronous /crawl still answers with
+    # every field, so anything reading HTML from this server keeps working.
+    drop_result_fields:
+      - html
+      - fit_html
+      - cleaned_html
+      - links
   browser:
     kwargs:
       headless: true

@@ -67,8 +67,11 @@ def _install_stubs():
 
     if "utils" not in sys.modules:
         stub = types.ModuleType("utils")
-        stub.load_config = lambda: {"crawler": {"memory_threshold_percent": 95.0}}
+        stub.load_config = lambda: {"crawler": {"memory_threshold_percent": 95.0, "pool": {"task_recycle_percent": 60}}}
         stub.get_container_memory_percent = lambda: 10.0
+        # Processes/threads, the limit that actually kills a crawl. A quiet
+        # container by default, so these suites keep testing what they test.
+        stub.get_container_task_percent = lambda: 5.0
         sys.modules["utils"] = stub
 
 
@@ -117,6 +120,9 @@ class PoolTestCase(unittest.TestCase):
             store.clear()
         pool.PERMANENT = None
         pool.DEFAULT_CONFIG_SIG = None
+        # A quiet container, whatever another test module left the shared `utils`
+        # stub reading. These suites are about liveness and leases, not task pressure.
+        pool.get_container_task_percent = lambda: 5.0
 
     tearDown = setUp
 

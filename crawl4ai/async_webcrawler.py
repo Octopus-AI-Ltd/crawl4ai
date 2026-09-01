@@ -192,6 +192,31 @@ class AsyncWebCrawler:
         """
         await self.crawler_strategy.__aexit__(None, None, None)
 
+    async def recycle_browser_if_process_starved(self) -> bool:
+        """
+        Ask the browser to restart if the container is short of processes and no
+        page would be lost by it. Returns True if it did.
+
+        Safe to call on any crawler: a strategy that does not drive a browser of
+        its own, or an internal layout that has moved, answers no rather than
+        raising. Losing a restart costs a slow crawl; raising here would kill the
+        crawl that called it.
+        """
+        manager = getattr(getattr(self, "crawler_strategy", None), "browser_manager", None)
+        recycle = getattr(manager, "recycle_if_process_starved", None)
+        if recycle is None:
+            return False
+        try:
+            return await recycle()
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(
+                    message="Could not restart the browser to free processes: {error}",
+                    tag="RECYCLE",
+                    params={"error": str(exc)},
+                )
+            return False
+
     async def __aenter__(self):
         return await self.start()
 

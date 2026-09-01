@@ -15,6 +15,7 @@ from .js_snippet import load_js_script
 from .config import DOWNLOAD_PAGE_TIMEOUT
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .utils import get_chromium_path
+from .resource_limits import container_task_usage_percent, may_recycle_browser
 import warnings
 
 
@@ -616,6 +617,12 @@ class BrowserManager:
         # when using a shared persistent context (context.pages may be empty
         # for all racers). Prevents 'Target page/context closed' errors.
         self._page_lock = asyncio.Lock()
+
+        # Serialize the mid-crawl browser restart, so two coroutines noticing the
+        # same process pressure do not both tear the browser down.
+        self._recycle_lock = asyncio.Lock()
+        # How many times this manager has restarted its browser to free processes.
+        self.process_recycles = 0
         
         # Stealth adapter for stealth mode
         self._stealth_adapter = None
@@ -1166,6 +1173,86 @@ class BrowserManager:
                     params={"error": str(e)}
                 )
             return None
+
+    def open_page_count(self) -> Optional[int]:
+        """
+        How many pages are open across the whole browser, or None if it cannot be told.
+
+        None is not zero. A caller about to close the browser has to know the
+        difference between "nothing would be lost" and "no idea", and the answer
+        when it cannot tell is to leave the browser alone.
+        """
+        browser = self.browser
+        if browser is None:
+            return None
+        try:
+            return sum(len(context.pages) for context in browser.contexts)
+        except Exception:
+            return None
+
+    async def recycle_if_process_starved(self) -> bool:
+        """
+        Restart the browser when the container is running out of processes, and
+        no open page would be lost by doing it. Returns True if it restarted.
+
+        Chromium holds its process tree for as long as it runs. Closing pages does
+        not give the processes back. Measured on Railway 2026-09-01, one crawl of
+        feelporto.com climbed from 650 to 952 of the container's 1000 tasks over
+        three minutes and stayed there - until the fork the container refused took
+        the browser with it, losing 107 of 248 pages. The moment the browser did
+        close, the count fell to 55. So a crawl long enough to reach the ceiling
+        cannot survive it without a restart partway through, and no amount of
+        waiting substitutes for one.
+
+        Restarts ONLY with zero pages open anywhere in the browser. That is what
+        makes it safe on a shared browser - the Docker pool hands one browser to
+        every crawl using the same config - because a browser with no pages open
+        has no crawl mid-page inside it. If a second crawl keeps pages open
+        throughout, the restart does not happen and nothing is broken by having
+        tried.
+        """
+        owns_browser = not (self.config.use_managed_browser or self.config.cdp_url)
+
+        # Cheap check before taking the lock, so the common case costs nothing.
+        if not may_recycle_browser(
+            container_task_usage_percent(),
+            self.open_page_count(),
+            owns_browser=owns_browser,
+            has_sessions=bool(self.sessions),
+        ):
+            return False
+
+        async with self._recycle_lock:
+            # Read it all again under the lock: another coroutine may have just
+            # restarted the browser, leaving nothing to relieve, or a page may
+            # have opened in the meantime.
+            task_pct = container_task_usage_percent()
+            if not may_recycle_browser(
+                task_pct,
+                self.open_page_count(),
+                owns_browser=owns_browser,
+                has_sessions=bool(self.sessions),
+            ):
+                return False
+
+            if self.logger:
+                self.logger.info(
+                    message="Restarting the browser to give back processes ({pct:.0f}% of the container's allowance used, no pages open)",
+                    tag="RECYCLE",
+                    params={"pct": task_pct or 0.0},
+                )
+            # start() closes the existing browser first, which is the whole point:
+            # the processes come back only when Chromium itself exits.
+            await self.start()
+            self.process_recycles += 1
+
+            if self.logger:
+                self.logger.info(
+                    message="Browser restarted, now at {pct:.0f}% of the process allowance",
+                    tag="RECYCLE",
+                    params={"pct": container_task_usage_percent() or 0.0},
+                )
+            return True
 
     async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
         """

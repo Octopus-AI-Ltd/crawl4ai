@@ -97,6 +97,16 @@ CRAWL_MEMORY_THRESHOLD_PERCENT = config["crawler"]["pool"].get("memory_threshold
 if CRAWL_MEMORY_THRESHOLD_PERCENT:
     os.environ["CRAWL4AI_MEMORY_THRESHOLD_PERCENT"] = str(CRAWL_MEMORY_THRESHOLD_PERCENT)
 
+# The process/thread brake, published for the same reason as the two above: the
+# dispatcher a deep crawl builds for itself reads it from the environment.
+CRAWL_TASK_BRAKE_PERCENT = config["crawler"]["pool"].get("task_brake_percent")
+if CRAWL_TASK_BRAKE_PERCENT:
+    os.environ["CRAWL4AI_TASK_BRAKE_PERCENT"] = str(CRAWL_TASK_BRAKE_PERCENT)
+
+CRAWL_TASK_RECYCLE_PERCENT = config["crawler"]["pool"].get("task_recycle_percent")
+if CRAWL_TASK_RECYCLE_PERCENT:
+    os.environ["CRAWL4AI_TASK_RECYCLE_PERCENT"] = str(CRAWL_TASK_RECYCLE_PERCENT)
+
 # ── security feature flags ───────────────────────────────────
 # Hooks are disabled by default for security (RCE risk). Set to "true" to enable.
 HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "true"

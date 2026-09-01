@@ -78,22 +78,29 @@ crawler:
     # browser is thrown away. Not a brake - Chromium only returns those tasks by
     # exiting, so there is nothing to wait for. See resource_limits.py.
     task_recycle_percent: 60
+    # The share of that allowance at which a crawl stops opening new pages, so the
+    # ones in flight can finish and the browser can be restarted with nothing open
+    # to lose. Above task_recycle_percent, which is what the restart then tests.
+    # A 248-page crawl reached 952 of 1000 on 2026-09-01 and lost 107 pages.
+    task_brake_percent: 70
   browser:
     kwargs:
       headless: true
       text_mode: true
     extra_args:
       # - "--single-process"
-      # Chromium is a process tree, and the cgroup `pids` limit counts every
-      # thread in it. Left alone it spawns a renderer per site and keeps them
-      # long after the pages are closed: 28 chrome processes and 725 threads were
-      # still resident with no crawl running - 80% of the container's 1000-task
-      # allowance - while memory sat at 28%. The next crawl then hit the ceiling
-      # mid-run and lost 435 of 500 pages. These two flags cap the sprawl at
-      # source; the pool recycling idle browsers is the safety net behind them.
+      # Chromium is a process tree and the cgroup `pids` limit counts every thread
+      # in it. These two are meant to cap the sprawl at source.
       #
-      # A crawl reads one site at a time, so collapsing same-site pages into one
-      # renderer costs nothing and saves most of the processes.
+      # ⚠️ Measured 2026-09-01, they do not: 38 Chromium processes holding 885
+      # threads during one crawl, of which 18+ were renderers, with the limit set
+      # to 8. Chromium treats it as a hint and site isolation overrides it. They
+      # are kept because they do no harm and may help on some pages, but nothing
+      # should be built on the assumption that they bound anything.
+      #
+      # What actually bounds it is restarting the browser mid-crawl - Chromium
+      # gives its processes back only by exiting. See resource_limits.py and
+      # BrowserManager.recycle_if_process_starved.
       - "--process-per-site"
       - "--renderer-process-limit=8"
       - "--no-sandbox"

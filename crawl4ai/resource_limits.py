@@ -1,6 +1,6 @@
 """
-The limits this process actually runs under: how much memory it may use, and how
-many pages it may open at once.
+The limits this process actually runs under: how much memory it may use, how many
+pages it may open at once, and how many processes and threads it may create.
 
 Kept in its own module, free of every crawl4ai import, because both the library
 and the Docker server need to read them and neither should have to import the
@@ -21,6 +21,13 @@ _CGROUP_MEMORY_PATHS = (
     ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
     # cgroup v1
     ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+
+_CGROUP_TASK_PATHS = (
+    # cgroup v2
+    ("/sys/fs/cgroup/pids.current", "/sys/fs/cgroup/pids.max"),
+    # cgroup v1
+    ("/sys/fs/cgroup/pids/pids.current", "/sys/fs/cgroup/pids/pids.max"),
 )
 
 # cgroup v1 spells "no limit" as an enormous sentinel rather than a word.
@@ -53,6 +60,69 @@ def container_memory_usage_percent() -> Optional[float]:
         return max(0.0, min(100.0, 100.0 * usage / limit))
 
     return None
+
+
+def container_task_usage_percent() -> Optional[float]:
+    """
+    Processes and threads in use as a share of the container's limit, or None if
+    there is no limit.
+
+    ⚠️ This counts THREADS, not processes — the cgroup `pids` controller limits
+    tasks, and every thread is a task. It is the limit that actually bites when
+    crawling, and it is invisible if you only watch memory.
+
+    Measured on Railway 2026-09-01, crawling 120 pages of one site:
+
+        memory   1.7 GB of 6.0 GB      (28%)  — nowhere near the limit
+        tasks    798 of 1000           (80%)  — and it stayed there when idle
+
+    Chromium is a process tree. A crawl leaves renderer processes behind, and 28 of
+    them were still resident with no crawl running, holding 725 threads between
+    them. The next crawl therefore starts with a fifth of the ceiling left, hits it
+    mid-run, and `clone()` starts failing: Python raises "can't start new thread",
+    the Playwright driver's pipe closes, and every page still queued dies with
+    "Connection closed while reading from the driver". A 500-page crawl of
+    feelporto.com lost 435 pages that way while memory sat at 30%.
+    """
+    for usage_path, limit_path in _CGROUP_TASK_PATHS:
+        try:
+            limit_text = Path(limit_path).read_text().strip()
+            if limit_text == "max":
+                return None
+            limit = int(limit_text)
+            usage = int(Path(usage_path).read_text().strip())
+        except (OSError, ValueError):
+            continue
+
+        if limit <= 0 or limit >= _CGROUP_UNLIMITED:
+            return None
+
+        return max(0.0, min(100.0, 100.0 * usage / limit))
+
+    return None
+
+
+# The share of the container's process/thread allowance past which a browser is
+# recycled rather than reused.
+#
+# Below where things break, with room for a crawl to finish: the ceiling is hit
+# during a run, not at the start, so the check has to leave enough headroom for
+# whatever the next run will spawn. At 798 of 1000 idle, an incoming crawl had
+# about 200 tasks to play with and needed roughly 740.
+TASK_RECYCLE_PERCENT = 60.0
+
+
+def default_task_recycle_percent() -> float:
+    """The task-usage share past which browsers are recycled, env override first."""
+    raw = os.environ.get("CRAWL4AI_TASK_RECYCLE_PERCENT")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return TASK_RECYCLE_PERCENT
+        if 0 < value <= 100:
+            return value
+    return TASK_RECYCLE_PERCENT
 
 
 # How many pages may be open at once when nobody says otherwise.

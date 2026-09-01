@@ -74,12 +74,28 @@ crawler:
     # actually break: Chromium was killed at 80.3% on 2026-08-31.
     memory_threshold_percent: 70
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
+    # The share of the container's process/thread allowance past which an IDLE
+    # browser is thrown away. Not a brake - Chromium only returns those tasks by
+    # exiting, so there is nothing to wait for. See resource_limits.py.
+    task_recycle_percent: 60
   browser:
     kwargs:
       headless: true
       text_mode: true
     extra_args:
       # - "--single-process"
+      # Chromium is a process tree, and the cgroup `pids` limit counts every
+      # thread in it. Left alone it spawns a renderer per site and keeps them
+      # long after the pages are closed: 28 chrome processes and 725 threads were
+      # still resident with no crawl running - 80% of the container's 1000-task
+      # allowance - while memory sat at 28%. The next crawl then hit the ceiling
+      # mid-run and lost 435 of 500 pages. These two flags cap the sprawl at
+      # source; the pool recycling idle browsers is the safety net behind them.
+      #
+      # A crawl reads one site at a time, so collapsing same-site pages into one
+      # renderer costs nothing and saves most of the processes.
+      - "--process-per-site"
+      - "--renderer-process-limit=8"
       - "--no-sandbox"
       - "--disable-dev-shm-usage"
       - "--disable-gpu"

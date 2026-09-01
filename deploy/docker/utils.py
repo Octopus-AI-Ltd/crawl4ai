@@ -194,6 +194,22 @@ def verify_email_domain(email: str) -> bool:
     except Exception as e:
         return False
 
+def get_container_task_percent() -> float:
+    """
+    Container processes/threads in use vs its `pids` limit; 0.0 when uncapped.
+
+    The other resource a crawl runs out of, and the one nothing was watching. See
+    crawl4ai.resource_limits.container_task_usage_percent for what it costs.
+    """
+    try:
+        from crawl4ai.resource_limits import container_task_usage_percent
+    except Exception:
+        return 0.0
+    usage = container_task_usage_percent()
+    # No cgroup limit is not a reason to start recycling browsers.
+    return 0.0 if usage is None else usage
+
+
 def get_container_memory_percent() -> float:
     """Container memory usage vs its limit, falling back to the host's own figure.
 

@@ -3,7 +3,7 @@ import asyncio, json, hashlib, time
 from contextlib import suppress
 from typing import Dict, Optional
 from crawl4ai import AsyncWebCrawler, BrowserConfig
-from utils import load_config, get_container_memory_percent
+from utils import load_config, get_container_memory_percent, get_container_task_percent
 import logging
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,26 @@ LEASE_STARTED: Dict[str, float] = {}
 
 # Config
 MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
+# The share of the container's process/thread allowance past which an idle browser
+# is thrown away rather than handed out again.
+#
+# Memory is not the resource that runs out first. Chromium leaves renderer
+# processes behind after a crawl, and closing the browser is the only thing that
+# reclaims them: after 120 pages the container sat at 798 of its 1000 tasks with
+# nothing running, holding 28 chrome processes and 725 threads, while memory was at
+# 28%. The next crawl then hits the ceiling mid-run, `clone()` fails, the Playwright
+# driver's pipe closes, and every page still queued dies at once. 435 of 500 pages
+# of feelporto.com were lost that way on 2026-09-01.
+#
+# So this is not a brake like the memory threshold — there is nothing to wait for,
+# because the tasks are not going to be given back. It is a recycle point.
+try:
+    from crawl4ai.resource_limits import default_task_recycle_percent
+    TASK_RECYCLE_LIMIT = CONFIG.get("crawler", {}).get("pool", {}).get(
+        "task_recycle_percent"
+    ) or default_task_recycle_percent()
+except Exception:
+    TASK_RECYCLE_LIMIT = CONFIG.get("crawler", {}).get("pool", {}).get("task_recycle_percent", 60.0)
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
 # A lease that is never given back would pin a browser for the life of the
 # process — an async generator that nobody consumes or closes is enough to do
@@ -181,6 +201,42 @@ async def _discard_dead(
         pass
 
 
+async def _recycle_if_starving_container(sig: str, tier: Optional[Dict[str, AsyncWebCrawler]], tier_name: str) -> bool:
+    """
+    Throw away an idle browser that is holding too much of the container's task
+    allowance, so the next crawl starts with room to run.
+
+    Returns True if the browser was recycled and the caller must build a fresh one.
+
+    ⚠️ Only ever done while the browser is IDLE. Closing one mid-crawl is the exact
+    failure this is trying to prevent — every page still queued behind it dies —
+    so a busy browser is left alone however many tasks it is holding. A crawl that
+    is already running is better finished than killed.
+    """
+    if is_busy(sig):
+        return False
+
+    task_pct = get_container_task_percent()
+    if task_pct < TASK_RECYCLE_LIMIT:
+        return False
+
+    crawler = tier.pop(sig, None) if tier is not None else None
+    _forget(sig)
+    logger.warning(
+        f"♻️  Recycling idle {tier_name} browser (sig={sig[:8]}) — container at "
+        f"{task_pct:.0f}% of its process limit, and Chromium only gives those back when it exits"
+    )
+    if crawler is not None:
+        with suppress(Exception):
+            await crawler.close()
+    try:
+        from monitor import get_monitor
+        await get_monitor().track_janitor_event("recycle_tasks", sig, {"tier": tier_name, "task_percent": round(task_pct, 1)})
+    except:
+        pass
+    return True
+
+
 def _track_usage(crawler: AsyncWebCrawler, sig: str) -> AsyncWebCrawler:
     """
     Hold a lease on the browser for as long as a crawl is actually running on it.
@@ -249,6 +305,16 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             if PERMANENT is not None and not is_alive(PERMANENT):
                 await _discard_dead(sig, PERMANENT, None, "default")
                 PERMANENT = None
+            if PERMANENT is not None and not is_busy(sig) and get_container_task_percent() >= TASK_RECYCLE_LIMIT:
+                task_pct = get_container_task_percent()
+                logger.warning(
+                    f"♻️  Recycling idle default browser — container at {task_pct:.0f}% of its "
+                    f"process limit, and Chromium only gives those back when it exits"
+                )
+                with suppress(Exception):
+                    await PERMANENT.close()
+                PERMANENT = None
+                _forget(sig)
             if PERMANENT is None:
                 logger.info("🔥 Starting default browser (lazy)")
                 PERMANENT = AsyncWebCrawler(config=DEFAULT_BROWSER_CONFIG or cfg, thread_safe=False)
@@ -263,6 +329,9 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             await _discard_dead(sig, HOT_POOL[sig], HOT_POOL, "hot pool")
 
         if sig in HOT_POOL:
+            await _recycle_if_starving_container(sig, HOT_POOL, "hot pool")
+
+        if sig in HOT_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             logger.info(f"♨️  Using hot pool browser (sig={sig[:8]})")
@@ -271,6 +340,9 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         # Check cold pool (promote to hot if used 3+ times)
         if sig in COLD_POOL and not is_alive(COLD_POOL[sig]):
             await _discard_dead(sig, COLD_POOL[sig], COLD_POOL, "cold pool")
+
+        if sig in COLD_POOL:
+            await _recycle_if_starving_container(sig, COLD_POOL, "cold pool")
 
         if sig in COLD_POOL:
             LAST_USED[sig] = time.time()
@@ -376,6 +448,25 @@ async def janitor():
             if PERMANENT is not None and not is_alive(PERMANENT):
                 await _discard_dead(DEFAULT_CONFIG_SIG or "default", PERMANENT, None, "default")
                 PERMANENT = None
+
+            # Then browsers that are alive but hoarding the container's process
+            # allowance. Chromium hands those back only when it exits, so waiting
+            # for the idle TTL just means the next crawl starts with no room. Done
+            # here as well as in get_crawler so a container left near the ceiling
+            # recovers on its own rather than on the next request.
+            task_pct = get_container_task_percent()
+            if task_pct >= TASK_RECYCLE_LIMIT:
+                for tier, tier_name in ((COLD_POOL, "cold pool"), (HOT_POOL, "hot pool")):
+                    for sig in list(tier.keys()):
+                        await _recycle_if_starving_container(sig, tier, tier_name)
+                if PERMANENT is not None and DEFAULT_CONFIG_SIG and not is_busy(DEFAULT_CONFIG_SIG, now):
+                    logger.warning(
+                        f"♻️  Recycling idle default browser — container at {task_pct:.0f}% of its process limit"
+                    )
+                    with suppress(Exception):
+                        await PERMANENT.close()
+                    PERMANENT = None
+                    _forget(DEFAULT_CONFIG_SIG)
 
             # Clean cold pool. A browser with a crawl running on it is never
             # idle, whatever its timestamp says — closing one mid-crawl kills

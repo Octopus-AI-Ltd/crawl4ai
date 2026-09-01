@@ -46,7 +46,9 @@ from utils import (
     get_llm_api_key,
     validate_llm_provider,
     get_llm_temperature,
-    get_llm_base_url
+    get_llm_base_url,
+    slim_crawl_result,
+    dropped_result_fields,
 )
 from webhook import WebhookDeliveryService
 
@@ -863,19 +865,34 @@ async def handle_crawl_job(
                 crawler_config=crawler_config,
                 config=config,
             )
+            # Strip the fields nobody collecting this job will read, BEFORE it is
+            # written down. A 500-page crawl of feelporto.com came to 243 MB kept
+            # whole, and Redis timed out handing it back: the job ended
+            # "completed" carrying the error "Timeout writing to socket", the API
+            # asked for its pages, got an error, and marked the source failed. All
+            # 500 pages had been read without a single failure.
+            stored = slim_crawl_result(result, dropped_result_fields(config))
+            payload = json.dumps(stored)
+            if len(payload) != len(json.dumps(result)):
+                logger.info(
+                    f"Crawl job {task_id}: stored result trimmed to "
+                    f"{len(payload) / 1_000_000:.1f} MB"
+                )
             await redis.hset(f"task:{task_id}", mapping={
                 "status": TaskStatus.COMPLETED,
-                "result": json.dumps(result),
+                "result": payload,
             })
 
-            # Send webhook notification on successful completion
+            # Send webhook notification on successful completion. The slimmed copy
+            # again: a webhook carrying its data inline has the same size to move,
+            # over a connection with the same patience for it.
             await webhook_service.notify_job_completion(
                 task_id=task_id,
                 task_type="crawl",
                 status="completed",
                 urls=urls,
                 webhook_config=webhook_config,
-                result=result
+                result=stored
             )
         except Exception as exc:
             await redis.hset(f"task:{task_id}", mapping={

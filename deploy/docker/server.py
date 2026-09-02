@@ -10,6 +10,7 @@ Crawl4AI FastAPI entry‑point
 from crawler_pool import get_crawler, close_all, janitor
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from auth import create_access_token, get_token_dependency, TokenRequest
+from shared_token import install as install_shared_token
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from fastapi import Request, Depends
@@ -281,6 +282,10 @@ def _setup_security(app_: FastAPI):
 
 
 _setup_security(app)
+
+# The front door. Must go on before anything else so it wraps every route,
+# including the ones other modules add below.
+install_shared_token(app)
 
 if config["observability"]["prometheus"]["enabled"]:
     Instrumentator().instrument(app).expose(app)

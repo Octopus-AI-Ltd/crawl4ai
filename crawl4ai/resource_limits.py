@@ -17,10 +17,15 @@ from pathlib import Path
 from typing import Optional
 
 _CGROUP_MEMORY_PATHS = (
-    # cgroup v2
-    ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+    # cgroup v2: usage, limit, and the breakdown that says how much of the usage is cache
+    ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.stat", "inactive_file"),
     # cgroup v1
-    ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    (
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory/memory.stat",
+        "total_inactive_file",
+    ),
 )
 
 _CGROUP_TASK_PATHS = (
@@ -34,14 +39,54 @@ _CGROUP_TASK_PATHS = (
 _CGROUP_UNLIMITED = 1 << 62
 
 
+def _reclaimable_cache_bytes(stat_path: str, field: str) -> int:
+    """
+    How much of the cgroup's charged memory is page cache the kernel can simply drop.
+
+    Zero when the breakdown cannot be read, which leaves the caller with the raw
+    figure — the behaviour before this existed. Not knowing must never inflate the
+    amount we claim is free.
+    """
+    try:
+        for line in Path(stat_path).read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == field:
+                return max(0, int(value))
+    except (OSError, ValueError):
+        return 0
+    return 0
+
+
 def container_memory_usage_percent() -> Optional[float]:
     """
-    Memory used as a share of the container's limit, or None if there is no limit.
+    Memory in USE as a share of the container's limit, or None if there is no limit.
 
     None means "not held to a container limit", not "zero" — callers fall back to
     the machine's own figures.
+
+    ⚠️ In use, not charged. `memory.current` counts page cache — file data the kernel
+    is holding on to purely because nothing else has needed the space yet, and which
+    it hands back the instant something does. Reading it raw reports a container as
+    nearly full when almost all of that is cache, and every brake downstream engages
+    against memory that was never a constraint.
+
+    Measured on Railway 2026-09-02, crawler idle, nothing running:
+
+        crawler process        1,130 MB
+        container limit        4,096 MB   → 28% genuinely in use
+        memory.current          ~71%      ← what we were reading
+        the difference         ~1.7 GB of reclaimable file cache
+
+    The page brake sits at 70%, so a container doing nothing at all was already past
+    it. Two crawls of feelporto.com were handed 1,241 pages each and returned 36 and
+    42, with no failures and no memory used, because the dispatcher stopped opening
+    pages before it opened any. The site's knowledge could not be refreshed at all,
+    and nothing looked broken — the crawls reported success.
+
+    Subtracting inactive file cache is the same correction Kubernetes makes for its
+    own "working set", and for the same reason.
     """
-    for usage_path, limit_path in _CGROUP_MEMORY_PATHS:
+    for usage_path, limit_path, stat_path, cache_field in _CGROUP_MEMORY_PATHS:
         try:
             limit_text = Path(limit_path).read_text().strip()
             if limit_text == "max":
@@ -57,7 +102,11 @@ def container_memory_usage_percent() -> Optional[float]:
         if limit >= psutil.virtual_memory().total:
             return None
 
-        return max(0.0, min(100.0, 100.0 * usage / limit))
+        # Clamped at zero: a usage and a cache figure read a moment apart can cross,
+        # and a negative reading would report a full container as empty.
+        in_use = max(0, usage - _reclaimable_cache_bytes(stat_path, cache_field))
+
+        return max(0.0, min(100.0, 100.0 * in_use / limit))
 
     return None
 

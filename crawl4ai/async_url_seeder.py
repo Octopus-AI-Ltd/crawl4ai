@@ -299,13 +299,17 @@ class AsyncUrlSeeder:
         ttl: timedelta = TTL,
         client: Optional[httpx.AsyncClient] = None,
         logger: Optional[AsyncLoggerBase] = None,  # NEW: Add logger parameter
-        # Who to say we are when fetching robots.txt and sitemaps. These are plain HTTP
-        # requests, not browser pages, so nothing else in a crawl governs them — and a host
-        # that filters stale browsers refuses them before any page is ever opened.
-        user_agent: Optional[str] = None,
         # NEW: Add base_directory
         base_directory: Optional[Union[str, pathlib.Path]] = None,
         cache_root: Optional[Union[str, Path]] = None,
+        # Who to say we are when fetching robots.txt and sitemaps. These are plain HTTP
+        # requests, not browser pages, so nothing else in a crawl governs them — and a host
+        # that filters stale browsers refuses them before any page is ever opened.
+        #
+        # ⭐ Last, deliberately. Every caller today passes by keyword, but this is a fork
+        # that takes upstream changes, and a parameter added mid-signature silently rebinds
+        # anyone who ever passes one positionally.
+        user_agent: Optional[str] = None,
     ):
         self.ttl = ttl
         self._owns_client = client is None  # Track if we created the client

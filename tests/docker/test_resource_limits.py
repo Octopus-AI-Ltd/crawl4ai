@@ -91,8 +91,19 @@ def with_cgroup(files):
 
 V2_USAGE = "/sys/fs/cgroup/memory.current"
 V2_LIMIT = "/sys/fs/cgroup/memory.max"
+V2_STAT = "/sys/fs/cgroup/memory.stat"
 V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
 V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+V1_STAT = "/sys/fs/cgroup/memory/memory.stat"
+
+
+def v2_stat(inactive_file, **extra):
+    """A realistic memory.stat — the field we want is never the first line."""
+    lines = ["anon 900000000", "file %d" % (inactive_file + 50_000_000), "kernel_stack 3000000"]
+    lines += ["%s %d" % (k, v) for k, v in extra.items()]
+    lines.append("inactive_file %d" % inactive_file)
+    lines.append("slab_reclaimable 40000000")
+    return FakeCgroupFile("\n".join(lines))
 
 
 class ContainerMemoryTests(unittest.TestCase):
@@ -235,6 +246,126 @@ class MemoryBrakeTests(unittest.TestCase):
         brake = cm.default_memory_threshold_percent()
         self.assertLess(brake - cm.RECOVERY_MARGIN_PERCENT, brake)
         self.assertGreater(brake - cm.RECOVERY_MARGIN_PERCENT, 0)
+
+
+class ReclaimableCacheTests(unittest.TestCase):
+    """
+    Page cache is not memory in use.
+
+    Regression test for 2026-09-02. `memory.current` counts file data the kernel is
+    keeping only because nothing has needed the space yet. Read raw, an idle crawler
+    reported 71% of its container while its own process held 1,130 MB of 4,096 MB —
+    28%. The page brake sits at 70%, so a container doing nothing was already past it.
+
+    Two crawls of feelporto.com were each handed 1,241 pages and returned 36 and 42,
+    with no failures and no memory used, because the dispatcher stopped opening pages
+    before it opened any. Both were rejected by the API for being too small to trust,
+    so the site could not be refreshed at all — and nothing looked broken, because
+    the crawls reported success.
+    """
+
+    # The live numbers, 2026-09-02.
+    LIMIT = 4_096 * 1024 * 1024
+    IN_USE = 1_130 * 1024 * 1024
+    CACHE = 1_770 * 1024 * 1024
+
+    def test_the_production_reading_that_stalled_every_crawl(self):
+        charged = self.IN_USE + self.CACHE
+        raw = 100.0 * charged / self.LIMIT
+        self.assertGreater(raw, 70.0, "the raw figure must be past the brake, or this test proves nothing")
+
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(charged)),
+            V2_STAT: v2_stat(self.CACHE),
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 27.6, places=1)
+
+    def test_the_corrected_reading_is_below_the_brake(self):
+        # The point of the whole change, stated against the threshold it has to clear.
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(self.IN_USE + self.CACHE)),
+            V2_STAT: v2_stat(self.CACHE),
+        }):
+            self.assertLess(cm.container_memory_usage_percent(), cm.DEFAULT_MEMORY_THRESHOLD_PERCENT)
+
+    def test_a_container_genuinely_full_still_reads_full(self):
+        # ⚠️ The dangerous direction. This brake is what stops Chromium being killed;
+        # subtracting too eagerly would report a dying container as healthy.
+        used = int(self.LIMIT * 0.95)
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(used)),
+            V2_STAT: v2_stat(0),
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 95.0, places=1)
+
+    def test_cgroup_v1_uses_its_own_spelling_of_the_field(self):
+        # v1 calls it total_inactive_file. Reading the v2 name here would silently
+        # subtract nothing and leave v1 hosts with the bug.
+        charged = self.IN_USE + self.CACHE
+        stat = FakeCgroupFile("cache %d\ntotal_inactive_file %d\nrss 100" % (charged, self.CACHE))
+        with with_cgroup({
+            V1_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V1_USAGE: FakeCgroupFile(str(charged)),
+            V1_STAT: stat,
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 27.6, places=1)
+
+    def test_a_missing_breakdown_falls_back_to_the_raw_figure(self):
+        # Degrades to the old behaviour rather than guessing. Not knowing how much is
+        # cache must never let us claim memory is free.
+        charged = self.IN_USE + self.CACHE
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(charged)),
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 100.0 * charged / self.LIMIT, places=1)
+
+    def test_an_unreadable_or_malformed_breakdown_is_ignored(self):
+        charged = self.IN_USE + self.CACHE
+        expected = 100.0 * charged / self.LIMIT
+        for stat in (
+            FakeCgroupFile(error=PermissionError("denied")),
+            FakeCgroupFile("inactive_file not-a-number"),
+            FakeCgroupFile(""),
+            FakeCgroupFile("anon 5\nfile 6"),
+        ):
+            with with_cgroup({
+                V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+                V2_USAGE: FakeCgroupFile(str(charged)),
+                V2_STAT: stat,
+            }):
+                self.assertAlmostEqual(cm.container_memory_usage_percent(), expected, places=1)
+
+    def test_a_negative_cache_figure_cannot_inflate_the_reading(self):
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(self.IN_USE)),
+            V2_STAT: FakeCgroupFile("inactive_file -999999999"),
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 100.0 * self.IN_USE / self.LIMIT, places=1)
+
+    def test_cache_larger_than_usage_reads_as_empty_not_negative(self):
+        # The two files are read a moment apart and can cross. A negative percentage
+        # would sail under every brake there is.
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(self.CACHE)),
+            V2_STAT: v2_stat(self.CACHE * 2),
+        }):
+            self.assertEqual(cm.container_memory_usage_percent(), 0.0)
+
+    def test_a_prefix_of_the_field_name_is_not_the_field(self):
+        # "inactive_file" must not be matched by "inactive_file_something", nor
+        # "file" by "inactive_file" — the v2 stat has several near-namesakes.
+        with with_cgroup({
+            V2_LIMIT: FakeCgroupFile(str(self.LIMIT)),
+            V2_USAGE: FakeCgroupFile(str(self.IN_USE)),
+            V2_STAT: FakeCgroupFile("inactive_file_foo 999999999999\nactive_file 888888888"),
+        }):
+            self.assertAlmostEqual(cm.container_memory_usage_percent(), 100.0 * self.IN_USE / self.LIMIT, places=1)
 
 
 if __name__ == "__main__":

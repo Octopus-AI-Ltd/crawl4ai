@@ -31,6 +31,8 @@ from urllib.parse import quote, urljoin
 
 import httpx
 import fnmatch
+
+from .browser_identity import DEFAULT_BROWSER_USER_AGENT
 try:
     from lxml import html as lxml_html
     from lxml import etree
@@ -297,15 +299,24 @@ class AsyncUrlSeeder:
         ttl: timedelta = TTL,
         client: Optional[httpx.AsyncClient] = None,
         logger: Optional[AsyncLoggerBase] = None,  # NEW: Add logger parameter
+        # Who to say we are when fetching robots.txt and sitemaps. These are plain HTTP
+        # requests, not browser pages, so nothing else in a crawl governs them — and a host
+        # that filters stale browsers refuses them before any page is ever opened.
+        user_agent: Optional[str] = None,
         # NEW: Add base_directory
         base_directory: Optional[Union[str, pathlib.Path]] = None,
         cache_root: Optional[Union[str, Path]] = None,
     ):
         self.ttl = ttl
         self._owns_client = client is None  # Track if we created the client
-        self.client = client or httpx.AsyncClient(http2=True, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) +AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-        })
+        # ⚠️ This string used to name Chrome 123 (and carried a stray "+" before
+        # AppleWebKit). abodebed.com's host 403s both that version and bare Python HTTP
+        # clients, so the sitemap came back empty and the crawl silently fell through to
+        # following links. See browser_identity for the evidence.
+        self.user_agent = user_agent or DEFAULT_BROWSER_USER_AGENT
+        self.client = client or httpx.AsyncClient(
+            http2=True, timeout=20, headers={"User-Agent": self.user_agent}
+        )
         self.logger = logger  # Store the logger instance
         self.base_directory = pathlib.Path(base_directory or os.getenv(
             "CRAWL4_AI_BASE_DIRECTORY", Path.home()))  # Resolve base_directory

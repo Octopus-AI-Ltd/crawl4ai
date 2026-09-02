@@ -986,7 +986,9 @@ async def handle_seed_request(
         results_by_url = {}
         total_urls = 0
 
-        async with AsyncUrlSeeder() as seeder:
+        # ⚠️ Not AsyncUrlSeeder() bare. Its built-in identity is what abodebed.com
+        # refused, and a refused sitemap returns an empty list rather than an error.
+        async with AsyncUrlSeeder(user_agent=seed_request.get("user_agent")) as seeder:
             for base_url in urls:
                 if not base_url.startswith(("http://", "https://")):
                     base_url = "https://" + base_url

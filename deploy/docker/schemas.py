@@ -120,6 +120,13 @@ class SeedRequest(BaseModel):
     force: bool = Field(
         False,
         description="Bypass cache, fetch fresh data")
+    user_agent: Optional[str] = Field(
+        None,
+        description=(
+            "Identity to send when fetching robots.txt and sitemaps. Defaults to "
+            "browser_identity.DEFAULT_BROWSER_USER_AGENT. Hosts that filter out-of-date "
+            "browsers answer 403 here, before any page is opened, and the caller sees only "
+            "an empty result — so the caller needs to be able to say who it is."))
     query: Optional[str] = Field(
         None,
         description="BM25 search query for relevance scoring")

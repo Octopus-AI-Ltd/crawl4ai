@@ -16,6 +16,7 @@ from .config import (
 )
 
 from .user_agent_generator import UAGen, ValidUAGenerator  # , OnlineUAGenerator
+from .browser_identity import DEFAULT_BROWSER_USER_AGENT
 from .extraction_strategy import ExtractionStrategy, LLMExtractionStrategy
 from .chunking_strategy import ChunkingStrategy, RegexChunking
 
@@ -419,8 +420,8 @@ class BrowserConfig:
                         Default: [].
         headers (dict): Extra HTTP headers to apply to all requests in this context.
                         Default: {}.
-        user_agent (str): Custom User-Agent string to use. Default: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36".
+        user_agent (str): Custom User-Agent string to use.
+                          Default: browser_identity.DEFAULT_BROWSER_USER_AGENT.
         user_agent_mode (str or None): Mode for generating the user agent (e.g., "random"). If None, use the provided
                                        user_agent as-is. Default: None.
         user_agent_generator_config (dict or None): Configuration for user agent generation if user_agent_mode is set.
@@ -463,12 +464,9 @@ class BrowserConfig:
         verbose: bool = True,
         cookies: list = None,
         headers: dict = None,
-        user_agent: str = (
-            # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) AppleWebKit/537.36 "
-            # "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            # "(KHTML, like Gecko) Chrome/116.0.5845.187 Safari/604.1 Edg/117.0.2045.47"
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36"
-        ),
+        # ⚠️ Was a hardcoded Chrome 116 — old enough that hosts filtering stale browsers
+        # return 403 to every page we open. See browser_identity for what that cost.
+        user_agent: str = DEFAULT_BROWSER_USER_AGENT,
         user_agent_mode: str = "",
         user_agent_generator_config: dict = {},
         text_mode: bool = False,
@@ -604,11 +602,11 @@ class BrowserConfig:
             java_script_enabled=kwargs.get("java_script_enabled", True),
             cookies=kwargs.get("cookies", []),
             headers=kwargs.get("headers", {}),
-            user_agent=kwargs.get(
-                "user_agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-            ),
+            # 🔴 THE one that actually applied. BrowserConfig.load({}) — which is what an
+            # empty browser_config on /crawl or /crawl/job becomes — lands here, so every
+            # page this deployment opened went out as Chrome 116 regardless of the default
+            # above. See browser_identity.
+            user_agent=kwargs.get("user_agent", DEFAULT_BROWSER_USER_AGENT),
             user_agent_mode=kwargs.get("user_agent_mode"),
             user_agent_generator_config=kwargs.get("user_agent_generator_config"),
             text_mode=kwargs.get("text_mode", False),

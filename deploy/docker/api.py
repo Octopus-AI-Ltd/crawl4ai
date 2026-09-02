@@ -50,6 +50,8 @@ from utils import (
     slim_crawl_result,
     dropped_result_fields,
 )
+from crawl4ai.browser_identity import DEFAULT_BROWSER_USER_AGENT
+from crawl4ai.robots_delay import choose_base_delay, parse_crawl_delay, robots_url_for
 from webhook import WebhookDeliveryService
 
 import psutil, time
@@ -550,6 +552,48 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
         #     logger.error(f"Crawler cleanup error: {e}")
         pass
 
+async def resolve_base_delay(urls: List[str], browser_config: dict, config: dict) -> Tuple[float, float]:
+    """How long to wait between pages of this crawl, after asking the site.
+
+    Best-effort by design. A robots.txt that will not load, or does not parse, or
+    asks for nothing leaves the configured default in place — reading the file is a
+    courtesy and must never be the reason a crawl does not happen.
+
+    ⚠️ Sent with the crawl's OWN user-agent, not httpx's. A site that refuses
+    unfamiliar clients answers robots.txt with a block page, and a block page
+    publishes no Crawl-delay, so asking as somebody else is how you conclude a site
+    wants nothing when it has asked for ten seconds.
+    """
+    default_range = tuple(config["crawler"]["rate_limiter"]["base_delay"])
+    if not urls:
+        return default_range
+
+    robots_url = robots_url_for(urls[0])
+    if not robots_url:
+        return default_range
+
+    user_agent = (browser_config or {}).get("user_agent") or DEFAULT_BROWSER_USER_AGENT
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": user_agent}) as client:
+            response = await client.get(robots_url, follow_redirects=True)
+        if response.status_code != 200:
+            return default_range
+        published = parse_crawl_delay(response.text, user_agent)
+    except Exception as exc:
+        logger.info("Could not read %s (%s) - using the default crawl delay", robots_url, exc)
+        return default_range
+
+    chosen = choose_base_delay(published, default_range, page_count=len(urls))
+    if published is not None:
+        logger.info(
+            "%s asks for %ss between pages; crawling %d page(s) at %.1f-%.1fs",
+            robots_url, published, len(urls), chosen[0], chosen[1],
+        )
+    return chosen
+
+
 async def handle_crawl_request(
     urls: List[str],
     browser_config: dict,
@@ -576,6 +620,8 @@ async def handle_crawl_request(
 
     try:
         urls = [('https://' + url) if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")) else url for url in urls]
+        # Before BrowserConfig.load, which replaces the dict with an object.
+        base_delay = await resolve_base_delay(urls, browser_config, config)
         browser_config = BrowserConfig.load(browser_config)
         crawler_config = CrawlerRunConfig.load(crawler_config)
 
@@ -586,7 +632,7 @@ async def handle_crawl_request(
             # dispatcher brakes at the same point.
             memory_threshold_percent=config["crawler"]["pool"].get("memory_threshold_percent"),
             rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+                base_delay=base_delay
             ) if config["crawler"]["rate_limiter"]["enabled"] else None
         )
         
@@ -761,6 +807,8 @@ async def handle_stream_crawl_request(
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
     try:
+        # Before BrowserConfig.load, which replaces the dict with an object.
+        base_delay = await resolve_base_delay(urls, browser_config, config)
         browser_config = BrowserConfig.load(browser_config)
         # browser_config.verbose = True # Set to False or remove for production stress testing
         browser_config.verbose = False
@@ -775,7 +823,7 @@ async def handle_stream_crawl_request(
             # dispatcher brakes at the same point.
             memory_threshold_percent=config["crawler"]["pool"].get("memory_threshold_percent"),
             rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+                base_delay=base_delay
             )
         )
 

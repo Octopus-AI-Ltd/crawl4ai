@@ -148,6 +148,14 @@ webhooks:
   enabled: true
   default_url: null  # Optional: default webhook URL for all jobs
   data_in_payload: false  # Optional: default behavior for including data
+  # How many crawled URLs the completion notification carries. It exists to say
+  # "this job is done, come and get it" — the results travel separately.
+  #
+  # Sent whole, a 1,241-page crawl of feelporto.com made a 121,582-byte
+  # notification against a receiver that accepts 102,400. Rejected with 413,
+  # nobody was told the crawl had finished, and 1,241 pages read without one
+  # failure went uncollected. `url_count` still carries the real number.
+  max_urls_in_payload: 10
   retry:
     max_attempts: 5
     initial_delay_ms: 1000  # 1s, 2s, 4s, 8s, 16s exponential backoff

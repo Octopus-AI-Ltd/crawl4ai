@@ -12,6 +12,43 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+# How many of the crawled URLs a completion notification carries.
+#
+# The notification exists to say "this job is done, come and get it". It is not
+# how the results travel, and it never was — the URL list is there so a reader can
+# see at a glance which site finished.
+#
+# Sent whole it is not a description of the crawl, it IS the crawl: a 1,241-page
+# crawl of feelporto.com produced a 121,582-byte notification, against a receiver
+# that accepts 102,400. It was rejected with 413, nobody was told the crawl had
+# finished, and 1,241 pages that had been read without a single failure went
+# uncollected. The results themselves were fine, 100.8 MB, sitting where they were
+# left. Only the message announcing them was too big to deliver.
+#
+# Ten is enough to recognise the crawl by. `url_count` carries the number, so
+# nothing is silently lost by the trimming.
+DEFAULT_MAX_URLS_IN_PAYLOAD = 10
+
+
+def sample_urls(urls, limit: Optional[int] = None):
+    """
+    The first few crawled URLs, for a notification that has to stay small.
+
+    Returns the list unchanged when it already fits, so a normal crawl's
+    notification looks exactly as it always did.
+    """
+    if not isinstance(urls, list):
+        return urls
+    cap = DEFAULT_MAX_URLS_IN_PAYLOAD if limit is None else limit
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = DEFAULT_MAX_URLS_IN_PAYLOAD
+    if cap < 0:
+        cap = DEFAULT_MAX_URLS_IN_PAYLOAD
+    return urls[:cap]
+
+
 class WebhookDeliveryService:
     """Handles webhook delivery with exponential backoff retry logic."""
 
@@ -113,7 +150,8 @@ class WebhookDeliveryService:
             task_id: The task identifier
             task_type: Type of task (e.g., "crawl", "llm_extraction")
             status: Task status ("completed" or "failed")
-            urls: List of URLs that were crawled
+            urls: List of URLs that were crawled. Only a sample of these travels
+                in the notification - see sample_urls for why.
             webhook_config: Webhook configuration from the job request
             result: Optional crawl result data
             error: Optional error message if failed
@@ -146,7 +184,8 @@ class WebhookDeliveryService:
             "task_type": task_type,
             "status": status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "urls": urls
+            "urls": sample_urls(urls, self.config.get("max_urls_in_payload")),
+            "url_count": len(urls) if isinstance(urls, list) else None,
         }
 
         if error:

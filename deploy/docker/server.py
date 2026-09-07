@@ -218,6 +218,13 @@ async def _timeline_updater():
         except Exception as e:
             logger.warning(f"Timeline update error: {e}")
 
+# ── crash reporting (OCTOPUS ADDITION) ───────────────────────
+# Before the app is built, so startup failures are covered too. Completely inert without
+# SENTRY_DSN, so upstream behaviour is unchanged. See observability.py.
+from observability import init_sentry, report_failure
+
+init_sentry()
+
 # ───────────────────── FastAPI instance ──────────────────────
 app = FastAPI(
     title=config["app"]["title"],
@@ -705,6 +712,14 @@ async def crawl(
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):
+        # OCTOPUS ADDITION: an HTTPException is not reported by Sentry (it looks like a
+        # deliberate response, not a crash), so every URL failing left no trace anywhere.
+        report_failure(
+            "crawl",
+            f"Crawl request failed: {results['results'][0]['error_message']}",
+            crawl_request.urls,
+            urls_requested=len(crawl_request.urls),
+        )
         raise HTTPException(500, f"Crawl request failed: {results['results'][0]['error_message']}")
     return JSONResponse(results)
 

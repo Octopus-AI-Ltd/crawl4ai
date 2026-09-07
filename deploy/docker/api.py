@@ -58,6 +58,9 @@ import psutil, time
 
 logger = logging.getLogger(__name__)
 
+# OCTOPUS ADDITION — see observability.py. Inert without SENTRY_DSN.
+from observability import report_exception
+
 # --- Helper to get memory ---
 def _get_memory_mb():
     try:
@@ -943,6 +946,11 @@ async def handle_crawl_job(
                 result=stored
             )
         except Exception as exc:
+            # OCTOPUS ADDITION: this is the crawl path octopus-be actually uses. Nothing is
+            # raised and nothing was logged — the cause went into a Redis field and a webhook
+            # body and was never seen again, which is why a failed crawl looked from the
+            # outside like a site that simply had no pages.
+            report_exception("crawl_job", urls, task_id=task_id, urls_requested=len(urls or []))
             await redis.hset(f"task:{task_id}", mapping={
                 "status": TaskStatus.FAILED,
                 "error": str(exc),
@@ -1128,6 +1136,14 @@ async def handle_seed_job(
                 result=result,
             )
         except Exception as exc:
+            # OCTOPUS ADDITION: same silent swallow as the crawl job above. Seeding is how a
+            # site's sitemap becomes a URL list, so when this dies the crawl that follows has
+            # nothing to work from.
+            report_exception(
+                "seed_job",
+                seed_request.get("urls", []),
+                task_id=task_id,
+            )
             await redis.hset(f"task:{task_id}", mapping={
                 "status": TaskStatus.FAILED,
                 "error": str(exc),

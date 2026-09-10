@@ -79,6 +79,57 @@ def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
     created = datetime.fromisoformat(created_at)
     return (datetime.now() - created).total_seconds() > ttl_seconds
 
+# ── OCTOPUS ADDITION: task records expire ────────────────────────────────────
+# A finished task used to stay in Redis for ever. The only thing that removed one was
+# handle_task_status, and only when a FINISHED task was asked about again more than an
+# hour after it started. octopus-be collects a crawl's result within minutes of the
+# webhook and never asks again, so every result stayed: on 2026-09-10 that was 153
+# crawls holding ~1.7 GB of the production Redis, the largest single one 268 MB.
+#
+# So every task record now carries an expiry:
+# - while it runs, TASK_PENDING_TTL_SECONDS (7 days) — a backstop for a job that never
+#   reaches a final state;
+# - once it finishes, TASK_RESULT_TTL_SECONDS (24 hours). octopus-be's BullMQ retries
+#   for collecting a result are over within ~8 minutes, and its last automatic look —
+#   the hourly crawl watchdog, which waits 90 minutes — is at most ~2.5 hours later.
+# A value of 0 or less leaves that stage without an expiry (the old behaviour).
+TASK_RESULT_TTL_SECONDS = int(os.environ.get("TASK_RESULT_TTL_SECONDS", 24 * 60 * 60))
+TASK_PENDING_TTL_SECONDS = int(os.environ.get("TASK_PENDING_TTL_SECONDS", 7 * 24 * 60 * 60))
+
+
+async def _write_task(redis, key, mapping: Dict, ttl_seconds: int) -> None:
+    # One MULTI/EXEC, so a crash between the two commands cannot leave a record that
+    # never expires.
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.hset(key, mapping=mapping)
+        if ttl_seconds > 0:
+            pipe.expire(key, ttl_seconds)
+        await pipe.execute()
+
+
+async def start_task(redis, key, mapping: Dict) -> None:
+    """Create a task record; it expires after TASK_PENDING_TTL_SECONDS if it never finishes."""
+    await _write_task(redis, key, mapping, TASK_PENDING_TTL_SECONDS)
+
+
+async def finish_task(redis, key, mapping: Dict) -> None:
+    """Record a task's final state (completed or failed); it expires TASK_RESULT_TTL_SECONDS later."""
+    await _write_task(redis, key, mapping, TASK_RESULT_TTL_SECONDS)
+
+
+async def stamp_heartbeat(redis, key, value: str) -> None:
+    """Refresh a running task's heartbeat without ever leaving a record that cannot expire.
+
+    HSET keeps an existing expiry, so a heartbeat landing after finish_task is harmless.
+    But if the record was already DELETED (a status poll cleans up old finished tasks),
+    HSET would recreate it holding only a heartbeat and no expiry — so give it one when
+    it has none. TTL == -1 is checked instead of using EXPIRE NX so this also works on
+    Redis older than 7.
+    """
+    await redis.hset(key, "heartbeat", value)
+    if TASK_PENDING_TTL_SECONDS > 0 and await redis.ttl(key) == -1:
+        await redis.expire(key, TASK_PENDING_TTL_SECONDS)
+
 def decode_redis_hash(hash_data: Dict[bytes, bytes]) -> Dict[str, str]:
     """Decode Redis hash data from bytes to strings."""
     return {k.decode('utf-8'): v.decode('utf-8') for k, v in hash_data.items()}

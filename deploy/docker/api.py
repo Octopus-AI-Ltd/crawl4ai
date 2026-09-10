@@ -42,6 +42,9 @@ from utils import (
     get_base_url,
     is_task_id,
     should_cleanup_task,
+    start_task,
+    finish_task,
+    stamp_heartbeat,
     decode_redis_hash,
     get_llm_api_key,
     validate_llm_provider,
@@ -136,7 +139,7 @@ async def _job_heartbeat(redis_conn, task_id: str, interval: int = 10):
     try:
         while True:
             await asyncio.sleep(interval)
-            await redis_conn.hset(f"task:{task_id}", "heartbeat",
+            await stamp_heartbeat(redis_conn, f"task:{task_id}",
                                   datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
     except asyncio.CancelledError:
         pass
@@ -164,7 +167,7 @@ async def process_llm_extraction(
         # Validate provider
         is_valid, error_msg = validate_llm_provider(config, provider)
         if not is_valid:
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.FAILED,
                 "error": error_msg
             })
@@ -204,7 +207,7 @@ async def process_llm_extraction(
             )
 
         if not result.success:
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.FAILED,
                 "error": result.error_message
             })
@@ -227,7 +230,7 @@ async def process_llm_extraction(
 
         result_data = {"extracted_content": content}
 
-        await redis.hset(f"task:{task_id}", mapping={
+        await finish_task(redis, f"task:{task_id}", {
             "status": TaskStatus.COMPLETED,
             "result": json.dumps(content)
         })
@@ -244,7 +247,7 @@ async def process_llm_extraction(
 
     except Exception as e:
         logger.error(f"LLM extraction error: {str(e)}", exc_info=True)
-        await redis.hset(f"task:{task_id}", mapping={
+        await finish_task(redis, f"task:{task_id}", {
             "status": TaskStatus.FAILED,
             "error": str(e)
         })
@@ -422,7 +425,7 @@ async def handle_task_status(
             last_hb = datetime.fromisoformat(task["heartbeat"])
             age = (datetime.now(timezone.utc).replace(tzinfo=None) - last_hb).total_seconds()
             if age > HEARTBEAT_STALE_SECONDS:
-                await redis.hset(f"task:{task_id}", mapping={
+                await finish_task(redis, f"task:{task_id}", {
                     "status": TaskStatus.FAILED,
                     "error": f"Job lost (no heartbeat for {int(age)}s)",
                 })
@@ -472,7 +475,7 @@ async def create_new_task(
     if webhook_config:
         task_data["webhook_config"] = json.dumps(webhook_config)
 
-    await redis.hset(f"task:{task_id}", mapping=task_data)
+    await start_task(redis, f"task:{task_id}", task_data)
 
     background_tasks.add_task(
         process_llm_extraction,
@@ -902,7 +905,7 @@ async def handle_crawl_job(
     if webhook_config:
         task_data["webhook_config"] = json.dumps(webhook_config)
 
-    await redis.hset(f"task:{task_id}", mapping=task_data)
+    await start_task(redis, f"task:{task_id}", task_data)
 
     # Initialize webhook service
     webhook_service = WebhookDeliveryService(config)
@@ -929,7 +932,7 @@ async def handle_crawl_job(
                     f"Crawl job {task_id}: stored result trimmed to "
                     f"{len(payload) / 1_000_000:.1f} MB"
                 )
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.COMPLETED,
                 "result": payload,
             })
@@ -951,7 +954,7 @@ async def handle_crawl_job(
             # body and was never seen again, which is why a failed crawl looked from the
             # outside like a site that simply had no pages.
             report_exception("crawl_job", urls, task_id=task_id, urls_requested=len(urls or []))
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.FAILED,
                 "error": str(exc),
             })
@@ -1115,7 +1118,7 @@ async def handle_seed_job(
     if webhook_config:
         task_data["webhook_config"] = json.dumps(webhook_config)
 
-    await redis.hset(f"task:{task_id}", mapping=task_data)
+    await start_task(redis, f"task:{task_id}", task_data)
 
     webhook_service = WebhookDeliveryService(config)
 
@@ -1123,7 +1126,7 @@ async def handle_seed_job(
         hb = asyncio.create_task(_job_heartbeat(redis, task_id))
         try:
             result = await handle_seed_request(seed_request)
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.COMPLETED,
                 "result": json.dumps(result),
             })
@@ -1144,7 +1147,7 @@ async def handle_seed_job(
                 seed_request.get("urls", []),
                 task_id=task_id,
             )
-            await redis.hset(f"task:{task_id}", mapping={
+            await finish_task(redis, f"task:{task_id}", {
                 "status": TaskStatus.FAILED,
                 "error": str(exc),
             })

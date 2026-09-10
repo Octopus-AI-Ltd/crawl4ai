@@ -37,6 +37,7 @@ from schemas import (
 )
 
 from utils import (
+    finish_task,
     FilterType, load_config, setup_logging, verify_email_domain
 )
 import os
@@ -152,7 +153,7 @@ async def _cleanup_stale_jobs(redis_conn):
         for key in keys:
             status_val = await redis_conn.hget(key, "status")
             if status_val and status_val.decode("utf-8") == "processing":
-                await redis_conn.hset(key, mapping={
+                await finish_task(redis_conn, key, {
                     "status": "failed",
                     "error": "Job interrupted by server restart",
                 })
